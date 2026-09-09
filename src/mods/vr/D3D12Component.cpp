@@ -229,6 +229,78 @@ bool is_deadzone_rogue_current_game() {
     return result;
 }
 
+bool is_sw_zero_company_ue56_dx12_current_game() {
+    static const bool game_and_engine_match = []() {
+        const auto executable = utility::get_executable();
+        const auto exe_path = utility::get_module_pathw(executable);
+
+        if (!exe_path) {
+            return false;
+        }
+
+        const auto detected_version = sdk::search_for_version(executable).value_or(L"0.00");
+        const auto file_version = sdk::get_file_version_info();
+        return uevr::games::is_sw_zero_company_ue56_runtime(
+            *exe_path,
+            detected_version,
+            file_version.dwFileVersionMS);
+    }();
+
+    return game_and_engine_match && g_framework != nullptr && g_framework->is_dx12();
+}
+
+bool is_bodycam_ue554_dx12_current_game() {
+    static const bool game_and_engine_match = []() {
+        const auto executable = utility::get_executable();
+        const auto exe_path = utility::get_module_pathw(executable);
+
+        if (!exe_path) {
+            return false;
+        }
+
+        const auto detected_version = sdk::search_for_version(executable).value_or(L"0.00");
+        const auto file_version = sdk::get_file_version_info();
+        return uevr::games::should_use_bodycam_ue554_dx12_texture_layout(
+            *exe_path,
+            detected_version,
+            file_version.dwFileVersionMS,
+            file_version.dwFileVersionLS,
+            true);
+    }();
+
+    return game_and_engine_match && g_framework != nullptr && g_framework->is_dx12();
+}
+
+std::unique_lock<std::recursive_mutex> acquire_bodycam_openxr_reconfigure_guard(
+    VR* vr,
+    uint32_t reasons)
+{
+    constexpr uint32_t serialized_reasons =
+        SWAPCHAIN_RECREATE_AFR_STATE |
+        SWAPCHAIN_RECREATE_DEPTH_EXTENT |
+        SWAPCHAIN_RECREATE_DEPTH_NULL_DEFAULTS;
+
+    if (!is_bodycam_ue554_dx12_current_game() ||
+        vr == nullptr ||
+        vr->get_runtime() == nullptr ||
+        !vr->get_runtime()->is_openxr() ||
+        (reasons & serialized_reasons) == 0)
+    {
+        return {};
+    }
+
+    const auto openxr = vr->get_openxr_runtime();
+    if (openxr == nullptr) {
+        return {};
+    }
+
+    std::unique_lock<std::recursive_mutex> guard{openxr->sync_mtx};
+    SPDLOG_INFO(
+        "[Bodycam][UE5.5.4][OpenXR] Serializing frame loop across D3D12 swapchain recreate reasons={}",
+        format_swapchain_recreate_reasons(reasons));
+    return guard;
+}
+
 bool is_dead_island_2_ue425_current_game() {
     static const bool result = []() {
         const auto exe_path = utility::get_module_pathw(utility::get_executable());
@@ -273,10 +345,20 @@ bool is_everspace2_current_game() {
 Microsoft::WRL::ComPtr<ID3D12Resource> acquire_scene_target_resource(
     VR* vr,
     const char* consumer,
-    bool* from_everspace2_snapshot = nullptr)
+    bool* from_everspace2_snapshot = nullptr,
+    bool* from_sw_zero_company_snapshot = nullptr,
+    bool* from_stalker2_snapshot = nullptr)
 {
     if (from_everspace2_snapshot != nullptr) {
         *from_everspace2_snapshot = false;
+    }
+
+    if (from_sw_zero_company_snapshot != nullptr) {
+        *from_sw_zero_company_snapshot = false;
+    }
+
+    if (from_stalker2_snapshot != nullptr) {
+        *from_stalker2_snapshot = false;
     }
 
     if (vr == nullptr) {
@@ -291,6 +373,123 @@ Microsoft::WRL::ComPtr<ID3D12Resource> acquire_scene_target_resource(
     const auto rtm = fake_stereo_hook->get_render_target_manager();
     if (rtm == nullptr) {
         return nullptr;
+    }
+
+    static const bool stalker2_ue55_runtime = []() {
+        const auto exe_path = utility::get_module_pathw(utility::get_executable());
+        if (!exe_path) {
+            return false;
+        }
+
+        const auto detected_version = sdk::search_for_version(utility::get_executable()).value_or(L"0.00");
+        const auto file_version = sdk::get_file_version_info();
+        return uevr::games::is_stalker2_ue55_runtime(
+            *exe_path,
+            detected_version,
+            file_version.dwFileVersionMS);
+    }();
+
+    if (stalker2_ue55_runtime && g_framework->is_dx12() && vr->is_using_afr()) {
+        const auto snapshot = rtm->get_stalker2_scene_target_snapshot();
+        const auto eye_width = static_cast<uint64_t>(vr->get_hmd_width());
+        const auto expected_height = static_cast<uint32_t>(vr->get_hmd_height());
+        const bool valid_extent =
+            eye_width != 0 &&
+            expected_height != 0 &&
+            snapshot != nullptr &&
+            (snapshot->desc.Width == eye_width || snapshot->desc.Width == eye_width * 2ull) &&
+            snapshot->desc.Height == expected_height;
+        const bool valid_snapshot =
+            valid_extent &&
+            snapshot->resource != nullptr &&
+            snapshot->source_texture != 0 &&
+            snapshot->desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
+            snapshot->desc.DepthOrArraySize == 1 &&
+            snapshot->desc.MipLevels == 1 &&
+            snapshot->desc.SampleDesc.Count == 1 &&
+            snapshot->desc.Format != DXGI_FORMAT_UNKNOWN &&
+            (snapshot->desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET) != 0 &&
+            (snapshot->desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL) == 0;
+
+        if (!valid_snapshot) {
+            SPDLOG_INFO_EVERY_N_SEC(
+                1,
+                "[Stalker2][UE5.5][SyncedRT] {} waiting for a validated completed-Draw scene snapshot; observed={}x{} expected={} or {} x {}",
+                consumer != nullptr ? consumer : "<unknown>",
+                snapshot != nullptr ? snapshot->desc.Width : 0,
+                snapshot != nullptr ? snapshot->desc.Height : 0,
+                eye_width,
+                eye_width * 2ull,
+                expected_height);
+            return nullptr;
+        }
+
+        if (from_stalker2_snapshot != nullptr) {
+            *from_stalker2_snapshot = true;
+        }
+
+        SPDLOG_INFO_EVERY_N_SEC(
+            5,
+            "[Stalker2][UE5.5][SyncedRT] {} consuming generation={} rhi={:x} native={:x} size={}x{}",
+            consumer != nullptr ? consumer : "<unknown>",
+            snapshot->generation,
+            snapshot->source_texture,
+            reinterpret_cast<uintptr_t>(snapshot->resource.Get()),
+            snapshot->desc.Width,
+            snapshot->desc.Height);
+        return snapshot->resource;
+    }
+
+    if (is_sw_zero_company_ue56_dx12_current_game()) {
+        const auto snapshot = rtm->get_sw_zero_company_scene_target_snapshot();
+        const auto current_target = rtm->get_render_target();
+        const auto expected_width = static_cast<uint64_t>(vr->get_hmd_width()) * 2ull;
+        const auto expected_height = static_cast<uint32_t>(vr->get_hmd_height());
+        if (snapshot == nullptr ||
+            snapshot->resource == nullptr ||
+            current_target == nullptr ||
+            snapshot->source_texture != reinterpret_cast<uintptr_t>(current_target) ||
+            expected_width == 0 ||
+            expected_height == 0 ||
+            snapshot->desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D ||
+            snapshot->desc.Width != expected_width ||
+            snapshot->desc.Height != expected_height ||
+            snapshot->desc.DepthOrArraySize != 1 ||
+            snapshot->desc.MipLevels != 1 ||
+            snapshot->desc.SampleDesc.Count != 1 ||
+            (snapshot->desc.Format != DXGI_FORMAT_R10G10B10A2_TYPELESS &&
+             snapshot->desc.Format != DXGI_FORMAT_R10G10B10A2_UNORM) ||
+            (snapshot->desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET) == 0 ||
+            (snapshot->desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL) != 0)
+        {
+            SPDLOG_INFO_EVERY_N_SEC(
+                1,
+                "[SWZeroCompany][UE5.6][SceneTargetSnapshot] {} waiting for an exact packed HMD Draw target; observed={}x{} array={} mips={} samples={} expected={}x{}",
+                consumer != nullptr ? consumer : "<unknown>",
+                snapshot != nullptr ? snapshot->desc.Width : 0,
+                snapshot != nullptr ? snapshot->desc.Height : 0,
+                snapshot != nullptr ? snapshot->desc.DepthOrArraySize : 0,
+                snapshot != nullptr ? snapshot->desc.MipLevels : 0,
+                snapshot != nullptr ? snapshot->desc.SampleDesc.Count : 0,
+                expected_width,
+                expected_height);
+            return nullptr;
+        }
+
+        if (from_sw_zero_company_snapshot != nullptr) {
+            *from_sw_zero_company_snapshot = true;
+        }
+
+        SPDLOG_INFO_EVERY_N_SEC(
+            5,
+            "[SWZeroCompany][UE5.6][SceneTargetSnapshot] {} consuming generation={} rhi={:x} native={:x} size={}x{}",
+            consumer != nullptr ? consumer : "<unknown>",
+            snapshot->generation,
+            snapshot->source_texture,
+            reinterpret_cast<uintptr_t>(snapshot->resource.Get()),
+            snapshot->desc.Width,
+            snapshot->desc.Height);
+        return snapshot->resource;
     }
 
     if (is_everspace2_current_game() && g_framework->is_dx12()) {
@@ -1624,7 +1823,14 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
     // get back buffer
     ComPtr<ID3D12Resource> backbuffer{};
     ComPtr<ID3D12Resource> real_backbuffer{};
-    backbuffer = acquire_scene_target_resource(vr, "D3D12Component::on_frame");
+    bool sw_zero_company_validated_scene_target{};
+    bool stalker2_validated_synced_scene_target{};
+    backbuffer = acquire_scene_target_resource(
+        vr,
+        "D3D12Component::on_frame",
+        nullptr,
+        &sw_zero_company_validated_scene_target,
+        &stalker2_validated_synced_scene_target);
 
     if (FAILED(swapchain->GetBuffer(swapchain->GetCurrentBackBufferIndex(), IID_PPV_ARGS(&real_backbuffer)))) {
         spdlog::error("[VR] Failed to get real back buffer.");
@@ -1651,8 +1857,16 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
             (uint32_t)desc.Flags);
     }
 
-    if (vr->is_extreme_compatibility_mode_enabled()) {
+    if (vr->is_extreme_compatibility_mode_enabled() &&
+        !sw_zero_company_validated_scene_target)
+    {
         backbuffer = real_backbuffer;
+    } else if (vr->is_extreme_compatibility_mode_enabled() &&
+               sw_zero_company_validated_scene_target)
+    {
+        SPDLOG_INFO_EVERY_N_SEC(
+            5,
+            "[SWZeroCompany][UE5.6][D3D12] Extreme Compatibility is consuming the validated scene target instead of the UI-only swapchain backbuffer");
     }
 
     if (is_deadzone_rogue_current_game() && backbuffer == nullptr && real_backbuffer != nullptr) {
@@ -1699,36 +1913,61 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
         backbuffer.Get() != nullptr &&
         real_backbuffer.Get() != nullptr &&
         backbuffer.Get() != real_backbuffer.Get();
-    // Dune's adopted viewport RT can churn and may be typeless, so never bind it
-    // directly as UEVR's game texture. Copy it into an owned stable texture first.
+    const auto is_sw_zero_company_ue56_external_backbuffer =
+        is_sw_zero_company_ue56_dx12_current_game() &&
+        backbuffer.Get() != nullptr &&
+        real_backbuffer.Get() != nullptr &&
+        backbuffer.Get() != real_backbuffer.Get();
+    const auto is_stalker2_ue55_synced_external_backbuffer =
+        stalker2_validated_synced_scene_target &&
+        backbuffer.Get() != nullptr &&
+        real_backbuffer.Get() != nullptr &&
+        backbuffer.Get() != real_backbuffer.Get();
+    // Volatile engine-owned viewport targets must not be retained as UEVR view
+    // resources. Copy them into an owned texture and restore the engine's state.
     const auto use_stable_external_backbuffer_copy =
         is_shf_external_backbuffer ||
         is_stalker2_ue51_external_backbuffer ||
+        is_stalker2_ue55_synced_external_backbuffer ||
         is_dune_external_backbuffer ||
-        is_dead_island_2_ue425_external_backbuffer;
+        is_dead_island_2_ue425_external_backbuffer ||
+        is_sw_zero_company_ue56_external_backbuffer;
     // FSceneViewport::EndRenderFrame transitions a separate stereo target to
-    // SRVMask before Present. Dune reaches us after that transition; declaring
-    // the source as RENDER_TARGET creates an invalid barrier and can leave the
-    // showroom/cinematic frame white while starving the render loop.
+    // SRVMask before Present. Declaring these validated sources as RENDER_TARGET
+    // creates an invalid barrier and can poison the engine's next transition.
     const auto volatile_external_source_state =
-        (is_shf_external_backbuffer || is_dune_external_backbuffer || is_dead_island_2_ue425_external_backbuffer)
+        (is_shf_external_backbuffer ||
+         is_dune_external_backbuffer ||
+         is_dead_island_2_ue425_external_backbuffer ||
+         is_sw_zero_company_ue56_external_backbuffer ||
+         is_stalker2_ue55_synced_external_backbuffer)
             ? ENGINE_SRC_COLOR
             : D3D12_RESOURCE_STATE_RENDER_TARGET;
     const char* stable_external_copy_label =
         is_dune_external_backbuffer ? "Dune" :
         is_dead_island_2_ue425_external_backbuffer ? "DeadIsland2 UE4.25" :
+        is_sw_zero_company_ue56_external_backbuffer ? "SWZeroCompany UE5.6" :
+        is_stalker2_ue55_synced_external_backbuffer ? "Stalker2 UE5.5 Synced" :
         is_stalker2_ue51_external_backbuffer ? "Stalker2 UE5.1" : "SHf";
     const wchar_t* stable_external_copy_name =
         is_dune_external_backbuffer ? L"Dune Stable Scene Copy" :
         is_dead_island_2_ue425_external_backbuffer ? L"DeadIsland2 UE4.25 Stable Scene Copy" :
+        is_sw_zero_company_ue56_external_backbuffer ? L"SWZeroCompany UE5.6 Stable Scene Copy" :
+        is_stalker2_ue55_synced_external_backbuffer ? L"Stalker2 UE5.5 Synced Stable Scene Copy" :
         is_stalker2_ue51_external_backbuffer ? L"Stalker2 UE5.1 Stable Scene Copy" : L"SHf Stable Scene Copy";
     const wchar_t* stable_external_copy_command_name =
         is_dune_external_backbuffer ? L"Dune Stable Scene Copy Commands" :
         is_dead_island_2_ue425_external_backbuffer ? L"DeadIsland2 UE4.25 Stable Scene Copy Commands" :
+        is_sw_zero_company_ue56_external_backbuffer ? L"SWZeroCompany UE5.6 Stable Scene Copy Commands" :
+        is_stalker2_ue55_synced_external_backbuffer ? L"Stalker2 UE5.5 Synced Stable Scene Copy Commands" :
         is_stalker2_ue51_external_backbuffer ? L"Stalker2 UE5.1 Stable Scene Copy Commands" : L"SHf Stable Scene Copy Commands";
     const auto skip_in_place_ui_invert = false;
     m_skip_spectator_view_for_volatile_external_rt =
-        is_shf_external_backbuffer || is_dune_external_backbuffer || is_dead_island_2_ue425_external_backbuffer;
+        is_shf_external_backbuffer ||
+        is_dune_external_backbuffer ||
+        is_dead_island_2_ue425_external_backbuffer ||
+        is_sw_zero_company_ue56_external_backbuffer ||
+        is_stalker2_ue55_synced_external_backbuffer;
     auto scene_source_state = use_stable_external_backbuffer_copy ? ENGINE_SRC_COLOR : D3D12_RESOURCE_STATE_RENDER_TARGET;
 
     if (is_stalker2_ue51_external_backbuffer) {
@@ -1897,10 +2136,19 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
     const auto ui_target = ffsr->get_render_target_manager()->get_ui_target();
 
     const auto frame_count = vr->m_render_frame_count;
+    namespace frame_diag = uevr::native_frame;
+    frame_diag::Ticket native_frame_ticket{};
     auto native_stereo_packet = ffsr != nullptr
-        ? ffsr->get_native_stereo_frame_packet_for_submit(frame_count)
+        ? ffsr->get_native_stereo_frame_packet_for_submit(frame_count, frame_diag::Backend::d3d12, &native_frame_ticket)
         : nullptr;
     auto* const native_stereo_hook = ffsr.get();
+    const auto record_native_submit = [&](frame_diag::Runtime api, frame_diag::Stage stage,
+        int32_t result = 0, uint8_t eye = 2, uint8_t call = 0) {
+        if (native_frame_ticket && native_stereo_packet != nullptr && native_stereo_hook != nullptr) {
+            native_stereo_hook->record_native_frame_stage(*native_stereo_packet, native_frame_ticket,
+                frame_diag::Backend::d3d12, api, stage, result, eye, call);
+        }
+    };
 
     const auto real_backbuffer_copy_needs_setup = [&]() {
         if (backbuffer.Get() != real_backbuffer.Get() ||
@@ -1973,6 +2221,214 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
                 commands.setup(L"Game Texture Commands");
             }
         }
+    } else if (backbuffer.Get() != real_backbuffer.Get() && is_sw_zero_company_ue56_external_backbuffer) {
+        const auto source_desc = backbuffer->GetDesc();
+        const auto source_view_format = concrete_color_view_format_for_resource(source_desc.Format);
+        const bool source_is_valid_r10 =
+            source_desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D &&
+            source_desc.Width > 0 &&
+            source_desc.Height > 0 &&
+            source_desc.DepthOrArraySize == 1 &&
+            source_desc.MipLevels == 1 &&
+            source_desc.SampleDesc.Count == 1 &&
+            (source_desc.Format == DXGI_FORMAT_R10G10B10A2_TYPELESS ||
+             source_desc.Format == DXGI_FORMAT_R10G10B10A2_UNORM) &&
+            source_view_format == DXGI_FORMAT_R10G10B10A2_UNORM &&
+            (source_desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET) != 0 &&
+            (source_desc.Flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE) == 0;
+
+        if (!source_is_valid_r10) {
+            SPDLOG_ERROR_EVERY_N_SEC(
+                1,
+                "[SWZeroCompany][UE5.6][D3D12] Refusing scene conversion because the exact R10 viewport contract failed "
+                "[{}x{} depth={} mips={} samples={} fmt={} flags=0x{:x}]",
+                source_desc.Width,
+                source_desc.Height,
+                source_desc.DepthOrArraySize,
+                source_desc.MipLevels,
+                source_desc.SampleDesc.Count,
+                static_cast<uint32_t>(source_desc.Format),
+                static_cast<uint32_t>(source_desc.Flags));
+            m_skip_spectator_view_for_volatile_external_rt = true;
+            return vr::VRCompositorError_None;
+        }
+
+        auto converted_desc = source_desc;
+        converted_desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+        converted_desc.Flags |= D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+        converted_desc.Flags &= ~D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE;
+
+        auto snapshot_desc = source_desc;
+        snapshot_desc.Flags |= D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+        snapshot_desc.Flags &= ~D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE;
+
+        const bool source_needs_setup =
+            m_sw_zero_company_scene_source_tex.texture.Get() != backbuffer.Get() ||
+            !texture_context_has_views(m_sw_zero_company_scene_source_tex);
+        const bool snapshot_needs_setup =
+            m_sw_zero_company_scene_snapshot_tex.texture.Get() == nullptr ||
+            !shf_texture_desc_matches(
+                m_sw_zero_company_scene_snapshot_tex.texture->GetDesc(),
+                snapshot_desc) ||
+            !texture_context_has_views(m_sw_zero_company_scene_snapshot_tex);
+        const bool output_needs_setup =
+            m_game_tex.texture.Get() == nullptr ||
+            !shf_texture_desc_matches(m_game_tex.texture->GetDesc(), converted_desc) ||
+            !texture_context_has_views(m_game_tex);
+
+        if (source_needs_setup || snapshot_needs_setup || output_needs_setup) {
+            // The source descriptors are referenced by our conversion command
+            // lists, while the owned snapshot and converted output can still be
+            // in an OpenXR copy. Drain all users before replacing any context.
+            for (auto& commands : m_game_tex_commands) {
+                if (commands.ready()) {
+                    commands.wait(INFINITE);
+                }
+            }
+
+            if (runtime->is_openxr()) {
+                m_openxr.wait_for_all_copies();
+            }
+
+            m_sw_zero_company_scene_source_tex.reset();
+            m_sw_zero_company_scene_snapshot_tex.reset();
+            m_game_tex.reset();
+
+            if (!m_sw_zero_company_scene_source_tex.setup(
+                    device,
+                    backbuffer.Get(),
+                    *source_view_format,
+                    *source_view_format,
+                    L"SWZeroCompany UE5.6 R10 Scene Source"))
+            {
+                SPDLOG_ERROR(
+                    "[SWZeroCompany][UE5.6][D3D12] Failed to create validated R10 scene-source descriptors");
+                m_sw_zero_company_scene_source_tex.reset();
+                return vr::VRCompositorError_None;
+            }
+
+            D3D12_HEAP_PROPERTIES heap_props{};
+            heap_props.Type = D3D12_HEAP_TYPE_DEFAULT;
+            heap_props.CPUPageProperty = D3D12_CPU_PAGE_PROPERTY_UNKNOWN;
+            heap_props.MemoryPoolPreference = D3D12_MEMORY_POOL_UNKNOWN;
+
+            ComPtr<ID3D12Resource> scene_snapshot{};
+            if (FAILED(device->CreateCommittedResource(
+                    &heap_props,
+                    D3D12_HEAP_FLAG_NONE,
+                    &snapshot_desc,
+                    ENGINE_SRC_COLOR,
+                    nullptr,
+                    IID_PPV_ARGS(&scene_snapshot))) ||
+                scene_snapshot == nullptr)
+            {
+                SPDLOG_ERROR(
+                    "[SWZeroCompany][UE5.6][D3D12] Failed to create owned R10 scene snapshot [{}x{}]",
+                    snapshot_desc.Width,
+                    snapshot_desc.Height);
+                m_sw_zero_company_scene_source_tex.reset();
+                return vr::VRCompositorError_None;
+            }
+
+            if (!m_sw_zero_company_scene_snapshot_tex.setup(
+                    device,
+                    scene_snapshot.Get(),
+                    *source_view_format,
+                    *source_view_format,
+                    L"SWZeroCompany UE5.6 Owned R10 Scene Snapshot"))
+            {
+                SPDLOG_ERROR(
+                    "[SWZeroCompany][UE5.6][D3D12] Failed to setup owned R10 scene snapshot");
+                m_sw_zero_company_scene_source_tex.reset();
+                m_sw_zero_company_scene_snapshot_tex.reset();
+                return vr::VRCompositorError_None;
+            }
+
+            ComPtr<ID3D12Resource> converted_scene{};
+            if (FAILED(device->CreateCommittedResource(
+                    &heap_props,
+                    D3D12_HEAP_FLAG_NONE,
+                    &converted_desc,
+                    ENGINE_SRC_COLOR,
+                    nullptr,
+                    IID_PPV_ARGS(&converted_scene))) ||
+                converted_scene == nullptr)
+            {
+                SPDLOG_ERROR(
+                    "[SWZeroCompany][UE5.6][D3D12] Failed to create owned BGRA scene-conversion texture [{}x{}]",
+                    converted_desc.Width,
+                    converted_desc.Height);
+                m_sw_zero_company_scene_source_tex.reset();
+                m_sw_zero_company_scene_snapshot_tex.reset();
+                return vr::VRCompositorError_None;
+            }
+
+            if (!m_game_tex.setup(
+                    device,
+                    converted_scene.Get(),
+                    DXGI_FORMAT_B8G8R8A8_UNORM,
+                    DXGI_FORMAT_B8G8R8A8_UNORM,
+                    L"SWZeroCompany UE5.6 BGRA Scene Conversion"))
+            {
+                SPDLOG_ERROR(
+                    "[SWZeroCompany][UE5.6][D3D12] Failed to setup owned BGRA scene-conversion texture");
+                m_sw_zero_company_scene_source_tex.reset();
+                m_sw_zero_company_scene_snapshot_tex.reset();
+                m_game_tex.reset();
+                return vr::VRCompositorError_None;
+            }
+
+            for (auto& commands : m_game_tex_commands) {
+                if (!commands.ready()) {
+                    commands.setup(L"SWZeroCompany UE5.6 Scene Conversion Commands");
+                }
+            }
+
+            SPDLOG_WARN(
+                "[SWZeroCompany][UE5.6][D3D12] Rebuilt owned R10 snapshot and BGRA scene conversion [{}x{} src_fmt={} dst_fmt={}]",
+                source_desc.Width,
+                source_desc.Height,
+                static_cast<uint32_t>(source_desc.Format),
+                static_cast<uint32_t>(converted_desc.Format));
+        }
+
+        const auto idx = swapchain->GetCurrentBackBufferIndex() % m_game_tex_commands.size();
+        auto& command_ctx = m_game_tex_commands[idx];
+        if (m_sw_zero_company_scene_conversion_batch == nullptr ||
+            !command_ctx.ready() ||
+            !texture_context_has_views(m_sw_zero_company_scene_source_tex) ||
+            !texture_context_has_views(m_sw_zero_company_scene_snapshot_tex) ||
+            !texture_context_has_views(m_game_tex))
+        {
+            SPDLOG_ERROR_EVERY_N_SEC(
+                1,
+                "[SWZeroCompany][UE5.6][D3D12] R10-to-BGRA conversion is not ready; refusing an incompatible fallback copy");
+            return vr::VRCompositorError_None;
+        }
+
+        command_ctx.wait(INFINITE);
+        command_ctx.copy(
+            m_sw_zero_company_scene_source_tex.texture.Get(),
+            m_sw_zero_company_scene_snapshot_tex.texture.Get(),
+            ENGINE_SRC_COLOR,
+            ENGINE_SRC_COLOR);
+        const float opaque_black[4]{0.0f, 0.0f, 0.0f, 1.0f};
+        command_ctx.clear_rtv(m_game_tex, opaque_black, ENGINE_SRC_COLOR);
+        d3d12::render_srv_to_rtv(
+            m_sw_zero_company_scene_conversion_batch.get(),
+            command_ctx.cmd_list.Get(),
+            m_sw_zero_company_scene_snapshot_tex,
+            m_game_tex,
+            ENGINE_SRC_COLOR,
+            ENGINE_SRC_COLOR);
+        command_ctx.execute();
+
+        SPDLOG_INFO_ONCE(
+            "[SWZeroCompany][UE5.6][D3D12] Snapshotted the R10 scene target before BGRA conversion for HMD/mirror/OpenXR");
+
+        m_skip_spectator_view_for_volatile_external_rt = false;
+        backbuffer = m_game_tex.texture;
+        scene_source_state = ENGINE_SRC_COLOR;
     } else if (backbuffer.Get() != real_backbuffer.Get() && (use_stable_external_backbuffer_copy || m_game_tex.texture.Get() != backbuffer.Get() || !texture_context_has_views(m_game_tex))) {
         log_shf_texture_reference_rebuild(backbuffer.Get(), real_backbuffer.Get(), m_game_tex.texture.Get(), frame_count);
 
@@ -1980,10 +2436,14 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
             const auto source_desc = backbuffer->GetDesc();
             const auto needs_copy_texture =
                 m_game_tex.texture.Get() == nullptr ||
-                !shf_texture_desc_matches(m_game_tex.texture->GetDesc(), source_desc);
+                !shf_texture_desc_matches(m_game_tex.texture->GetDesc(), source_desc) ||
+                (is_stalker2_ue55_synced_external_backbuffer &&
+                 m_game_tex.texture.Get() == real_backbuffer.Get());
 
             if (needs_copy_texture) {
-                if ((is_dune_external_backbuffer || is_dead_island_2_ue425_external_backbuffer) &&
+                if ((is_dune_external_backbuffer ||
+                     is_dead_island_2_ue425_external_backbuffer ||
+                     is_stalker2_ue55_synced_external_backbuffer) &&
                     m_game_tex.texture.Get() != nullptr)
                 {
                     // Startup can use a desktop-sized copy before gameplay
@@ -2025,7 +2485,9 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
 
                 ComPtr<ID3D12Resource> stable_copy{};
                 const auto needs_concrete_stable_view =
-                    is_dune_external_backbuffer || is_dead_island_2_ue425_external_backbuffer;
+                    is_dune_external_backbuffer ||
+                    is_dead_island_2_ue425_external_backbuffer ||
+                    is_stalker2_ue55_synced_external_backbuffer;
                 const auto concrete_stable_view_format = needs_concrete_stable_view
                     ? concrete_color_view_format_for_resource(copy_desc.Format)
                     : std::optional<DXGI_FORMAT>{DXGI_FORMAT_B8G8R8A8_UNORM};
@@ -2053,8 +2515,9 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
 
                 if (FAILED(device->CreateCommittedResource(&heap_props, D3D12_HEAP_FLAG_NONE, &copy_desc, ENGINE_SRC_COLOR, nullptr, IID_PPV_ARGS(&stable_copy)))) {
                     SPDLOG_ERROR_EVERY_N_SEC(1,
-                        "[{}][D3D12] Failed to create owned stable scene copy [{}x{} fmt={} flags=0x{:x}]; falling back to volatile RT path",
-                        stable_external_copy_label, copy_desc.Width, copy_desc.Height, (uint32_t)copy_desc.Format, (uint32_t)copy_desc.Flags);
+                        "[{}][D3D12] Failed to create owned stable scene copy [{}x{} fmt={} flags=0x{:x}]; applying guarded fallback policy",
+                        stable_external_copy_label,
+                        copy_desc.Width, copy_desc.Height, (uint32_t)copy_desc.Format, (uint32_t)copy_desc.Flags);
                     m_game_tex.reset();
                 } else if (!m_game_tex.setup(device, stable_copy.Get(), stable_rtv_format, stable_srv_format, stable_external_copy_name)) {
                     spdlog::error("[{}][D3D12] Failed to setup owned stable scene copy.", stable_external_copy_label);
@@ -2084,12 +2547,14 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
                     SPDLOG_INFO_EVERY_N_SEC(2,
                         "[{}][D3D12] Copied volatile external RT into owned stable scene texture for HMD{}",
                         stable_external_copy_label,
-                        (is_dune_external_backbuffer || is_dead_island_2_ue425_external_backbuffer)
+                        (is_dune_external_backbuffer ||
+                         is_dead_island_2_ue425_external_backbuffer ||
+                         is_stalker2_ue55_synced_external_backbuffer)
                             ? "/mirror/2D using SRVMask source state"
                             : "/mirror/2D");
 
-                    // The spectator reads the owned texture, never Dune's volatile
-                    // typeless viewport target, so descriptor creation is safe here.
+                    // Spectator and HMD consumers read the owned texture, never the
+                    // engine's volatile viewport target.
                     m_skip_spectator_view_for_volatile_external_rt = false;
                     backbuffer = m_game_tex.texture;
                     scene_source_state = ENGINE_SRC_COLOR;
@@ -2097,7 +2562,10 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
             }
 
             if (m_game_tex.texture.Get() == nullptr) {
-                if (is_dune_external_backbuffer || is_dead_island_2_ue425_external_backbuffer) {
+                if (is_dune_external_backbuffer ||
+                    is_dead_island_2_ue425_external_backbuffer ||
+                    is_stalker2_ue55_synced_external_backbuffer)
+                {
                     SPDLOG_ERROR_EVERY_N_SEC(
                         1,
                         "[{}][D3D12] Stable scene copy unavailable; refusing volatile viewport RT reference to avoid stale descriptors",
@@ -2294,6 +2762,7 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
         right_width = m_scene_capture_width,
         right_height = m_scene_capture_height,
         native_stereo_packet,
+        native_frame_ticket,
         native_stereo_hook](d3d12::CommandContext& commands, ID3D12Resource* render_target) {
         if (render_target == nullptr || left_source == nullptr || right_source == nullptr || native_stereo_packet == nullptr) {
             return;
@@ -2325,6 +2794,11 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
         );
 
         if (native_stereo_hook != nullptr) {
+            if (native_frame_ticket) {
+                native_stereo_hook->record_native_frame_stage(*native_stereo_packet, native_frame_ticket,
+                    frame_diag::Backend::d3d12, frame_diag::Runtime::openxr, frame_diag::Stage::copy_recorded,
+                    0, 2, 0, right_source.Get(), render_target);
+            }
             native_stereo_hook->note_native_stereo_frame_packet_consumed(native_stereo_packet->serial);
         }
     };
@@ -3301,6 +3775,7 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
                         reasons |= SWAPCHAIN_RECREATE_DEPTH_NULL_DEFAULTS;
                     }
                     log_openxr_swapchain_recreate(vr, reasons, (uint32_t)desc.Width, (uint32_t)desc.Height);
+                    auto bodycam_frame_loop_guard = acquire_bodycam_openxr_reconfigure_guard(vr, reasons);
                     prepare_openxr_swapchain_recreate(vr, reasons);
                     m_openxr.create_swapchains(); // recreate swapchains to match the new depth size
                 }
@@ -3547,7 +4022,9 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
             };
             const auto left_bounds = vr::VRTextureBounds_t{runtime->view_bounds[0][0], runtime->view_bounds[0][2],
                                                            runtime->view_bounds[0][1], runtime->view_bounds[0][3]};
+            record_native_submit(frame_diag::Runtime::openvr, frame_diag::Stage::submit_attempt, 0, 0);
             auto e = vr::VRCompositor()->Submit(vr::Eye_Left, &left_eye, &left_bounds, vr::EVRSubmitFlags::Submit_TextureWithPose);
+            record_native_submit(frame_diag::Runtime::openvr, frame_diag::Stage::submit_result, static_cast<int32_t>(e), 0);
 
             if (e != vr::VRCompositorError_None) {
                 spdlog::error("[VR] VRCompositor failed to submit left eye: {}", (int)e);
@@ -3761,7 +4238,7 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
                             native_stereo_array_swapchain,
                             nullptr,
                             [left_source, right_source, left_src_box, right_src_box, left_source_state, right_source_state,
-                                using_native_scene_capture, native_stereo_packet, native_stereo_hook](
+                                using_native_scene_capture, native_stereo_packet, native_stereo_hook, native_frame_ticket](
                                 d3d12::CommandContext& commands,
                                 ID3D12Resource* dst) mutable {
                                 commands.copy_region_to_subresource(
@@ -3780,6 +4257,11 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
                                     D3D12_RESOURCE_STATE_RENDER_TARGET);
 
                                 if (using_native_scene_capture && native_stereo_packet != nullptr && native_stereo_hook != nullptr) {
+                                    if (native_frame_ticket) {
+                                        native_stereo_hook->record_native_frame_stage(*native_stereo_packet, native_frame_ticket,
+                                            frame_diag::Backend::d3d12, frame_diag::Runtime::openxr, frame_diag::Stage::copy_recorded,
+                                            0, 2, 0, right_source.Get(), dst);
+                                    }
                                     native_stereo_hook->note_native_stereo_frame_packet_consumed(native_stereo_packet->serial);
                                 }
                             },
@@ -3826,7 +4308,9 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
                 };
                 const auto left_bounds = vr::VRTextureBounds_t{runtime->view_bounds[0][0], runtime->view_bounds[0][2],
                                                                runtime->view_bounds[0][1], runtime->view_bounds[0][3]};
+                record_native_submit(frame_diag::Runtime::openvr, frame_diag::Stage::submit_attempt, 0, 0);
                 auto e = vr::VRCompositor()->Submit(vr::Eye_Left, &left_eye, &left_bounds, vr::EVRSubmitFlags::Submit_TextureWithPose);
+                record_native_submit(frame_diag::Runtime::openvr, frame_diag::Stage::submit_result, static_cast<int32_t>(e), 0);
 
                 if (e != vr::VRCompositorError_None) {
                     spdlog::error("[VR] VRCompositor failed to submit left eye: {}", (int)e);
@@ -3839,6 +4323,11 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
                 } else {
                     m_openvr.copy_left_to_right(m_scene_capture_tex.texture.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET);
                     if (native_stereo_packet != nullptr && native_stereo_hook != nullptr) {
+                        if (native_frame_ticket) {
+                            native_stereo_hook->record_native_frame_stage(*native_stereo_packet, native_frame_ticket,
+                                frame_diag::Backend::d3d12, frame_diag::Runtime::openvr, frame_diag::Stage::copy_recorded,
+                                0, 1, 0, m_scene_capture_tex.texture.Get(), m_openvr.get_right().texture.Get());
+                        }
                         native_stereo_hook->note_native_stereo_frame_packet_consumed(native_stereo_packet->serial);
                     }
                 }
@@ -3858,7 +4347,9 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
             };
             const auto right_bounds = vr::VRTextureBounds_t{runtime->view_bounds[1][0], runtime->view_bounds[1][2],
                                                             runtime->view_bounds[1][1], runtime->view_bounds[1][3]};
+            record_native_submit(frame_diag::Runtime::openvr, frame_diag::Stage::submit_attempt, 0, 1);
             auto e = vr::VRCompositor()->Submit(vr::Eye_Right, &right_eye, &right_bounds, vr::EVRSubmitFlags::Submit_TextureWithPose);
+            record_native_submit(frame_diag::Runtime::openvr, frame_diag::Stage::submit_result, static_cast<int32_t>(e), 1);
             runtime->frame_synced = false;
 
             if (e != vr::VRCompositorError_None) {
@@ -3963,7 +4454,10 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
             }
             
             if (is_ue58_runtime_cached()) {
-                m_openxr.retire_framework_ui_delayed_release(true);
+                // Keep presenting the last released overlay image until the
+                // new GPU copy retires instead of serializing every frame.
+                // The delayed-release helper still has a bounded recovery wait.
+                m_openxr.retire_framework_ui_delayed_release(false);
             }
 
             if (!suppress_ui_copy && m_openxr.ever_acquired((uint32_t)runtimes::OpenXR::SwapchainIndex::FRAMEWORK_UI)) {
@@ -3973,11 +4467,13 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
                 }
             }
 
+            record_native_submit(frame_diag::Runtime::openxr, frame_diag::Stage::submit_attempt);
             auto result = vr->m_openxr->end_frame(
                 quad_layers,
                 scene_depth_tex.Get() != nullptr &&
                     !native_stereo_array_submit_active &&
                     !dead_island_2_afr_depth_disabled);
+            record_native_submit(frame_diag::Runtime::openxr, frame_diag::Stage::submit_result, static_cast<int32_t>(result));
 
             if (result == XR_ERROR_LAYER_INVALID) {
                 spdlog::info("[VR] Attempting to correct invalid layer");
@@ -3985,7 +4481,9 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
                 m_openxr.wait_for_all_copies();
 
                 spdlog::info("[VR] Calling xrEndFrame again");
+                record_native_submit(frame_diag::Runtime::openxr, frame_diag::Stage::submit_attempt, 0, 2, 1);
                 result = vr->m_openxr->end_frame(quad_layers);
+                record_native_submit(frame_diag::Runtime::openxr, frame_diag::Stage::submit_result, static_cast<int32_t>(result), 2, 1);
             }
 
             vr->m_openxr->needs_pose_update = true;
@@ -4786,6 +5284,8 @@ void D3D12Component::on_reset(VR* vr) {
     m_game_ui_tex.reset();
     reset_ue58_converted_ui_textures();
     m_game_tex.reset();
+    m_sw_zero_company_scene_source_tex.reset();
+    m_sw_zero_company_scene_snapshot_tex.reset();
     m_ue58_spectator_tex.reset();
     m_ue58_dedicated_ui_spectator_valid = false;
     m_scene_capture_tex.reset();
@@ -4807,6 +5307,7 @@ void D3D12Component::on_reset(VR* vr) {
     m_shf_scene_mode = ShfSceneMode::Unknown;
     m_backbuffer_batch.reset();
     m_game_batch.reset();
+    m_sw_zero_company_scene_conversion_batch.reset();
     m_ui_batch_alpha_invert.reset();
     m_graphics_memory.reset();
 
@@ -4879,6 +5380,7 @@ void D3D12Component::on_reset(VR* vr) {
             }
 
             log_openxr_swapchain_recreate(vr, reasons, new_depth_width, new_depth_height);
+            auto bodycam_frame_loop_guard = acquire_bodycam_openxr_reconfigure_guard(vr, reasons);
             prepare_openxr_swapchain_recreate(vr, reasons);
             const auto swapchain_error = m_openxr.create_swapchains();
             if ((reasons & SWAPCHAIN_RECREATE_SCENE_TARGET_READY) != 0) {
@@ -4919,7 +5421,14 @@ bool D3D12Component::setup() {
     auto swapchain = hook->get_swap_chain();
 
     ComPtr<ID3D12Resource> backbuffer{};
-    backbuffer = acquire_scene_target_resource(vr.get(), "D3D12Component::setup");
+    bool sw_zero_company_validated_scene_target{};
+    bool stalker2_validated_synced_scene_target{};
+    backbuffer = acquire_scene_target_resource(
+        vr.get(),
+        "D3D12Component::setup",
+        nullptr,
+        &sw_zero_company_validated_scene_target,
+        &stalker2_validated_synced_scene_target);
 
     ComPtr<ID3D12Resource> real_backbuffer{};
     if (FAILED(swapchain->GetBuffer(swapchain->GetCurrentBackBufferIndex(), IID_PPV_ARGS(&real_backbuffer)))) {
@@ -4927,8 +5436,16 @@ bool D3D12Component::setup() {
         return false;
     }
 
-    if (vr->is_extreme_compatibility_mode_enabled()) {
+    if (vr->is_extreme_compatibility_mode_enabled() &&
+        !sw_zero_company_validated_scene_target)
+    {
         backbuffer = real_backbuffer;
+    } else if (vr->is_extreme_compatibility_mode_enabled() &&
+               sw_zero_company_validated_scene_target)
+    {
+        SPDLOG_INFO_EVERY_N_SEC(
+            5,
+            "[SWZeroCompany][UE5.6][D3D12] Setup retained the validated scene target under Extreme Compatibility");
     }
 
     const bool deadzone_real_backbuffer_bootstrap =
@@ -4964,6 +5481,11 @@ bool D3D12Component::setup() {
     const auto real_backbuffer_desc = real_backbuffer->GetDesc();
 
     auto backbuffer_desc = backbuffer->GetDesc();
+    const bool stalker2_single_eye_synced_source =
+        stalker2_validated_synced_scene_target &&
+        vr->is_using_afr() &&
+        backbuffer_desc.Width == static_cast<uint64_t>(vr->get_hmd_width()) &&
+        backbuffer_desc.Height == vr->get_hmd_height();
 
     spdlog::info("[VR] D3D12 Real backbuffer width: {}, height: {}, format: {}", real_backbuffer_desc.Width, real_backbuffer_desc.Height, (uint32_t)real_backbuffer_desc.Format);
 
@@ -4971,7 +5493,10 @@ bool D3D12Component::setup() {
     backbuffer_desc.Flags &= ~D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE;
     backbuffer_desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
 
-    if (!vr->is_extreme_compatibility_mode_enabled() && !real_backbuffer_bootstrap) {
+    if (!vr->is_extreme_compatibility_mode_enabled() &&
+        !real_backbuffer_bootstrap &&
+        !stalker2_single_eye_synced_source)
+    {
         backbuffer_desc.Width /= 2; // The texture we get from UE is both eyes combined. we will copy the regions later.
     }
 
@@ -5070,6 +5595,30 @@ bool D3D12Component::setup() {
 
     m_backbuffer_batch = setup_sprite_batch_pso(real_backbuffer_desc.Format);
     m_game_batch = setup_sprite_batch_pso(backbuffer_desc.Format);
+
+    if (is_sw_zero_company_ue56_dx12_current_game()) {
+        DirectX::SpriteBatchPipelineStateDescription scene_conversion_pd{
+            DirectX::RenderTargetState{DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_UNKNOWN}};
+        auto& scene_blend = scene_conversion_pd.blendDesc.RenderTarget[0];
+        // Copy RGB while keeping the destination alpha at the opaque value
+        // established by the per-frame clear. The engine's R10 target does not
+        // guarantee meaningful alpha, but OpenXR must receive an opaque scene.
+        scene_blend.BlendEnable = TRUE;
+        scene_blend.LogicOpEnable = FALSE;
+        scene_blend.SrcBlend = D3D12_BLEND_ONE;
+        scene_blend.DestBlend = D3D12_BLEND_ZERO;
+        scene_blend.BlendOp = D3D12_BLEND_OP_ADD;
+        scene_blend.SrcBlendAlpha = D3D12_BLEND_ZERO;
+        scene_blend.DestBlendAlpha = D3D12_BLEND_ONE;
+        scene_blend.BlendOpAlpha = D3D12_BLEND_OP_ADD;
+        scene_blend.RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+
+        m_sw_zero_company_scene_conversion_batch = setup_sprite_batch_pso(
+            DXGI_FORMAT_B8G8R8A8_UNORM,
+            {},
+            {},
+            scene_conversion_pd);
+    }
 
     // Custom blend state to flip the alpha in-place of the UI texture without an intermediate render target
     {
@@ -5421,12 +5970,17 @@ std::optional<std::string> D3D12Component::OpenXR::create_swapchains() {
             depth_desc.Height = vr->get_hmd_height();
         }
 
+        const bool defer_bodycam_afr_depth =
+            create_afr_depth &&
+            is_bodycam_ue554_dx12_current_game() &&
+            this->made_depth_with_null_defaults;
+
         if (!create_afr_depth) {
             spdlog::info("[VR] Creating double wide depth swapchain");
             if (auto err = create_swapchain((uint32_t)runtimes::OpenXR::SwapchainIndex::DEPTH, depth_swapchain_create_info, depth_desc)) {
                 return err;
             }
-        } else if (!skip_dead_island_2_afr_depth) {
+        } else if (!skip_dead_island_2_afr_depth && !defer_bodycam_afr_depth) {
             spdlog::info("[VR] Creating AFR depth swapchain");
             spdlog::info("[VR] Creating AFR left eye depth swapchain");
             if (auto err = create_swapchain((uint32_t)runtimes::OpenXR::SwapchainIndex::AFR_DEPTH_LEFT_EYE, depth_swapchain_create_info, depth_desc)) {
@@ -5437,8 +5991,11 @@ std::optional<std::string> D3D12Component::OpenXR::create_swapchains() {
             if (auto err = create_swapchain((uint32_t)runtimes::OpenXR::SwapchainIndex::AFR_DEPTH_RIGHT_EYE, depth_swapchain_create_info, depth_desc)) {
                 return err;
             }
-        } else {
+        } else if (skip_dead_island_2_afr_depth) {
             SPDLOG_INFO_ONCE("[DeadIsland2][UE4.25][OpenXR] Skipping invalid AFR depth swapchain creation");
+        } else {
+            SPDLOG_INFO(
+                "[Bodycam][UE5.5.4][OpenXR] Deferring AFR depth swapchains until SceneDepthZ has a validated live descriptor");
         }
     }
 
@@ -5804,11 +6361,6 @@ void D3D12Component::OpenXR::copy_framework_ui_ue58(
         }
     }
 
-    // Give the previous UI copy until the next UI draw to finish before we
-    // acquire a fresh image. This keeps the visible UI layer current without
-    // doing the older immediate wait directly after recording the copy.
-    retire_framework_ui_delayed_release(true);
-
     std::scoped_lock _{this->mtx};
 
     auto vr = VR::get();
@@ -5839,9 +6391,9 @@ void D3D12Component::OpenXR::copy_framework_ui_ue58(
     auto& ctx = ctx_it->second;
 
     if (ctx.framework_ui_pending_release) {
-        SPDLOG_WARNING_EVERY_N_SEC(
+        SPDLOG_INFO_EVERY_N_SEC(
             2,
-            "[UE5.8][FrameworkUI] FRAMEWORK_UI copy is still pending after forced retirement; skipping this UI update");
+            "[UE5.8][FrameworkUI] Reusing the last released FRAMEWORK_UI image while the next copy is pending");
         return;
     }
 
