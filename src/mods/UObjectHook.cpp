@@ -136,6 +136,20 @@ bool is_avowed_uobjecthook_guard_enabled() {
     return result;
 }
 
+// The Outer Worlds 2 (UE 5.4.4, WinGDK): UObjectBase::AddObject discovery lands on
+// the unverified "backup function" fallback, whose RCX is not a UObjectBase*. The
+// vanilla is_rcx path then walks a garbage class chain from a loading thread and
+// faults (super == 0xffffffffffffffff). Route it through the dynamic candidate guard
+// and require FUObjectArray membership, exactly like Avowed.
+bool is_outerworlds2_uobjecthook_guard_enabled() {
+    static const bool result = []() {
+        const auto exe_path = utility::get_module_pathw(utility::get_executable());
+        return exe_path && uevr::games::is_outerworlds2_executable_path(*exe_path);
+    }();
+
+    return result;
+}
+
 bool is_stalker2_uobjecthook_guard_enabled() {
     static const bool result = []() {
         const auto exe_path = utility::get_module_pathw(utility::get_executable());
@@ -203,6 +217,7 @@ bool use_dynamic_uobjecthook_candidate_guard() {
     return is_ue4_14_through_4_17_uobjecthook_guard_enabled() ||
         is_ue_5_1_uobjecthook_guard_enabled() ||
         is_avowed_uobjecthook_guard_enabled() ||
+        is_outerworlds2_uobjecthook_guard_enabled() ||
         is_stalker2_uobjecthook_guard_enabled() ||
         is_everwind_uobjecthook_guard_enabled();
 }
@@ -1231,7 +1246,8 @@ bool UObjectHook::add_new_object(sdk::UObjectBase* object, bool run_creation_job
         }
     }
 
-    const auto require_array_member = is_avowed_uobjecthook_guard_enabled();
+    const auto require_array_member = is_avowed_uobjecthook_guard_enabled() ||
+        is_outerworlds2_uobjecthook_guard_enabled();
 
     if (!candidate_already_validated && use_dynamic_uobjecthook_candidate_guard() &&
         !is_safe_uobject_candidate(*this, object, require_array_member)) {
