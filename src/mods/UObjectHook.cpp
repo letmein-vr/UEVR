@@ -916,6 +916,8 @@ void UObjectHook::hook() {
             "[Stalker2][UObjectHook] Deferring initial adoption of {} existing UObjects; using on-demand common-root tracking",
             object_count);
     } else {
+        const auto backfill_start = std::chrono::steady_clock::now();
+
         for (auto i = 0; i < object_count; ++i) {
             auto object = uobjectarray->get_object(i);
 
@@ -923,12 +925,20 @@ void UObjectHook::hook() {
                 continue;
             }
 
-            add_new_object(object->get_object());
+            // These entries come straight out of FUObjectArray, so they are array members by
+            // construction. Running the dynamic candidate guard here costs ~a dozen VirtualQuery
+            // syscalls per object, which turns a ~2s backfill into a multi-minute game-thread
+            // stall on titles with 500k+ live objects (The Outer Worlds 2).
+            add_new_object(object->get_object(), true, true);
         }
 
         m_uobject_array_scan_cursor = object_count;
         m_uobject_array_last_object_count = object_count;
         m_uobject_array_startup_scan_until = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+
+        SPDLOG_INFO("[UObjectHook] Backfill of {} FUObjectArray entries took {} ms",
+            object_count,
+            std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - backfill_start).count());
     }
 
     SPDLOG_INFO("[UObjectHook] Added {} existing objects", m_objects.size());
@@ -6134,25 +6144,29 @@ void* UObjectHook::add_object(void* rcx, void* rdx, void* r8, void* r9, void* st
             };
 
             constexpr size_t candidate_count = sizeof(candidates) / sizeof(candidates[0]);
-            bool valid_candidates[candidate_count]{};
 
             // The original call has completed by this point, so a real AddObject candidate
             // should now be present in FUObjectArray. Requiring array membership keeps
             // wrong callsites from polluting UObjectHook with random UObject-looking values.
             constexpr bool require_array_member = true;
 
-            for (size_t i = 0; i < candidate_count; ++i) {
-                valid_candidates[i] = is_safe_uobject_candidate(*hook, candidates[i].object, require_array_member);
-            }
-
             const auto previous = preferred_candidate.load(std::memory_order_relaxed);
             int selected_candidate{};
 
-            if (previous > 0 && previous <= (int)candidate_count && valid_candidates[previous - 1]) {
+            // Each candidate probe is several VirtualQuery syscalls, and AddObject fires for
+            // every UObject the game creates. Try the register that worked last time first and
+            // only fall back to probing all eight slots when it doesn't validate.
+            if (previous > 0 && previous <= (int)candidate_count &&
+                is_safe_uobject_candidate(*hook, candidates[previous - 1].object, require_array_member))
+            {
                 selected_candidate = previous;
             } else {
                 for (size_t i = 0; i < candidate_count; ++i) {
-                    if (valid_candidates[i]) {
+                    if ((int)i + 1 == previous) {
+                        continue; // already probed above
+                    }
+
+                    if (is_safe_uobject_candidate(*hook, candidates[i].object, require_array_member)) {
                         selected_candidate = (int)i + 1;
                         break;
                     }
@@ -6248,7 +6262,10 @@ void* UObjectHook::add_object(void* rcx, void* rdx, void* r8, void* r9, void* st
         }
 
         ++hook->m_debug.constructor_calls;
-        hook->add_new_object(obj);
+
+        // The guarded path above already validated layout + FUObjectArray membership for obj;
+        // don't pay for a second round of VirtualQuery probes inside add_new_object.
+        hook->add_new_object(obj, true, use_dynamic_uobjecthook_candidate_guard());
     }
 
     return result;
