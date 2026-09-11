@@ -874,7 +874,20 @@ void UObjectHook::hook() {
         return;
     }
 
-    if (add_object_fn) {
+    // The Outer Worlds 2: AddObject discovery lands on an unrelated per-object helper whose
+    // RCX is a fixed global, so the guarded hook never yields a reliable register. Worse,
+    // stray stack slots occasionally validate, which keeps the "unreliable" fallback from
+    // ever engaging, so every object created by a save load pays ~80 VirtualQuery probes on
+    // the loading thread and the load never finishes. Skip the inline hook entirely and let
+    // the budgeted FUObjectArray scan on the game thread pick up new objects instead.
+    const bool skip_add_object_hook = add_object_fn && is_outerworlds2_uobjecthook_guard_enabled();
+
+    if (skip_add_object_hook) {
+        SPDLOG_WARN("[UObjectHook] Not hooking resolved AddObject candidate {:x} on this title; using incremental FUObjectArray creation tracking",
+            (uintptr_t)add_object_fn.value());
+    }
+
+    if (add_object_fn && !skip_add_object_hook) {
         m_add_object_hook = safetyhook::create_inline((void**)add_object_fn.value(), &add_object);
 
         if (m_add_object_hook) {
