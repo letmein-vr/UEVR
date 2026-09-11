@@ -45,6 +45,7 @@
 #include "VR.hpp"
 
 #include "GameSpecific.hpp"
+#include "ExceptionHandler.hpp"
 #include "UObjectHook.hpp"
 
 //#define VERBOSE_UOBJECTHOOK
@@ -755,6 +756,12 @@ void UObjectHook::hook() {
 
     SPDLOG_INFO("[UObjectHook] Hooking UObjectBase");
 
+    // Diagnostics build: from here on every log line is flushed so the tail of
+    // log.txt is trustworthy if the process dies inside the hook window.
+    framework::enable_log_flush_all("UObjectHook::hook");
+    SPDLOG_INFO("[UObjectHook] hook() running on tid={} game_thread={}",
+        GetCurrentThreadId(), GameThreadWorker::get().is_same_thread());
+
     if (is_ue4_14_through_4_17_uobjecthook_guard_enabled()) {
         const auto object_array = sdk::FUObjectArray::get();
 
@@ -865,6 +872,16 @@ void UObjectHook::hook() {
     } else {
         SPDLOG_INFO("[UObjectHook] Hooked UObjectBase destructor; AddObject creation tracking is using FUObjectArray scanning");
     }
+
+    SPDLOG_INFO("[UObjectHook] Inline hooks live: destructor={:x} add_object={:x} (game module base {:x})",
+        (uintptr_t)destructor_fn.value(),
+        add_object_fn ? (uintptr_t)add_object_fn.value() : 0,
+        (uintptr_t)utility::get_executable());
+
+    // Diagnostics build: the inline trampolines are now live on every thread that
+    // creates or destroys UObjects. Record any hardware fault from this point on,
+    // before the engine's own SEH handler swallows it.
+    framework::arm_first_chance_exception_logger("UObjectHook inline hooks installed");
 
     // Add all the objects that already exist
     auto uobjectarray = sdk::FUObjectArray::get();
