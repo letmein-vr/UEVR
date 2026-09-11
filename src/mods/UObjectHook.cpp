@@ -771,9 +771,13 @@ void UObjectHook::hook() {
 
     SPDLOG_INFO("[UObjectHook] Hooking UObjectBase");
 
-    // Diagnostics build: from here on every log line is flushed so the tail of
-    // log.txt is trustworthy if the process dies inside the hook window.
-    framework::enable_log_flush_all("UObjectHook::hook");
+    // Opt-in diagnostics (UObjectHook_LogFlushAll): from here on every log line is
+    // flushed so the tail of log.txt is trustworthy if the process dies inside the
+    // hook window. Off by default because a flush per line can hitch heavy loggers.
+    if (m_log_flush_all->value()) {
+        framework::enable_log_flush_all("UObjectHook::hook (UObjectHook_LogFlushAll=true)");
+    }
+
     SPDLOG_INFO("[UObjectHook] hook() running on tid={} game_thread={}",
         GetCurrentThreadId(), GameThreadWorker::get().is_same_thread());
 
@@ -3902,6 +3906,10 @@ void UObjectHook::draw_config() {
     m_enabled_at_startup->draw("Enabled at Startup");
     m_attach_lerp_enabled->draw("Enable Attach Lerp");
     m_attach_lerp_speed->draw("Attach Lerp Speed");
+    m_log_flush_all->draw("Flush Log Every Line (diagnostics)");
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("Flushes log.txt after every message once UObjectHook activates.\nUse when the game dies with a truncated log. Takes effect on next activation.");
+    }
 
     ImGui::SetNextItemOpen(true, ImGuiCond_::ImGuiCond_Once);
     if (ImGui::TreeNode("UObjectHook Keybinds")) {

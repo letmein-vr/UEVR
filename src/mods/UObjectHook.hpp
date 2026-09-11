@@ -579,6 +579,10 @@ private:
     ModToggle::Ptr m_attach_lerp_enabled{ModToggle::create(generate_name("AttachLerpEnabled"), true)};
     ModSlider::Ptr m_attach_lerp_speed{ModSlider::create(generate_name("AttachLerpSpeed"), 0.01f, 30.0f, 15.0f)};
 
+    // Diagnostics: flush log.txt after every message once UObjectHook is activated.
+    // Off by default; a flush per line can hitch on titles that log heavily.
+    ModToggle::Ptr m_log_flush_all{ModToggle::create(generate_name("LogFlushAll"), false)};
+
     ModKey::Ptr m_keybind_toggle_uobject_hook{ModKey::create(generate_name("ToggleUObjectHookKey"))};
     bool m_uobject_hook_disabled{false};
     bool m_fixed_visibilities{false};
@@ -619,6 +623,7 @@ public:
             *m_enabled_at_startup,
             *m_attach_lerp_enabled,
             *m_attach_lerp_speed,
+            *m_log_flush_all,
             *m_keybind_toggle_uobject_hook
         };
     }
