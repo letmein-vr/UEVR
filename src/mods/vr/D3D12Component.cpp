@@ -3815,6 +3815,17 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
 
     bool is_using_afw = vr->is_using_afw();
 
+    auto backbuffer_index = swapchain->GetCurrentBackBufferIndex();
+
+    EyeIndex nEye = (frame_count % 2 == vr->m_left_eye_interval) ? EyeLeft : EyeRight;
+    EyeIndex nEyeOther = (frame_count % 2 == vr->m_left_eye_interval) ? EyeRight : EyeLeft;
+    auto eyeFrameBuffer = m_eyeFrameBuffers.eyeFrameBuffers[nEye];
+    auto otherEyeFrameBuffer = m_eyeFrameBuffers.eyeFrameBuffers[nEyeOther];
+    FrameWarpEvaluateParams params;
+
+    // The frame warp renderer only exists when AFW was the selected rendering
+    // method at init (see VR::clean_initialize); skip all plugin work otherwise.
+    if (vr->d3d12Renderer != nullptr) {
     const auto bb_desc = backbuffer->GetDesc();
     const auto eye_width = static_cast<uint32_t>(bb_desc.Width / 2);
     const auto eye_height = static_cast<uint32_t>(bb_desc.Height);
@@ -3829,13 +3840,6 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
             vr->rawDepthTex = scene_depth_tex.Get();
     }
 
-    auto backbuffer_index = swapchain->GetCurrentBackBufferIndex();
-
-    EyeIndex nEye = (frame_count % 2 == vr->m_left_eye_interval) ? EyeLeft : EyeRight;
-    EyeIndex nEyeOther = (frame_count % 2 == vr->m_left_eye_interval) ? EyeRight : EyeLeft;
-    auto eyeFrameBuffer = m_eyeFrameBuffers.eyeFrameBuffers[nEye];
-    auto otherEyeFrameBuffer = m_eyeFrameBuffers.eyeFrameBuffers[nEyeOther];
-    FrameWarpEvaluateParams params;
     if ((is_using_afw) && (!eyeFrameBuffer.color.pTexture || !otherEyeFrameBuffer.color.pTexture))
         force_reset();
 
@@ -3944,6 +3948,7 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
     }
 
     vr->d3d12Renderer->EndCommandList(backbuffer_index);
+    } // vr->d3d12Renderer != nullptr
 
     // #############################
     // #Frame Warp Module End
@@ -5516,7 +5521,8 @@ bool D3D12Component::setup() {
     // #############################
     static uint32_t lastSize[2]{0, 0};
     static DXGI_FORMAT lastFormat = DXGI_FORMAT_UNKNOWN;
-    if (!vr->is_using_2d_screen() && (lastSize[0] != vr->get_hmd_width() || lastSize[1] != vr->get_hmd_height() || lastFormat != backbuffer_desc.Format)) {
+    // Only allocate frame warp buffers when the AFW renderer was initialized (see VR::clean_initialize).
+    if (vr->d3d12Renderer != nullptr && !vr->is_using_2d_screen() && (lastSize[0] != vr->get_hmd_width() || lastSize[1] != vr->get_hmd_height() || lastFormat != backbuffer_desc.Format)) {
         FrameWarpInitParams params = {vr->get_hmd_width(), vr->get_hmd_height(), backbuffer_desc.Format};
         spdlog::info("[VR] Before InitFrameWarp");
         m_eyeFrameBuffers = InitFrameWarp(params);

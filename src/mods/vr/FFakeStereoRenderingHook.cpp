@@ -5386,9 +5386,12 @@ bool stalker2_uses_lazy_synced_viewstates() {
     }
 
     const auto vr = VR::get();
+    // AFW is AFR-like but not "strict synchronized"; on this Stalker 2 build it must
+    // still take the lazy view-state allocator path, since the generic LocalPlayer
+    // view-count fix re-runs GSCLocalPlayer::PostInitProperties (delegates/flags).
     return vr != nullptr && uevr::vr_compatibility::should_avoid_stalker2_synced_post_init(
         true,
-        vr->is_using_strict_synchronized_afr(),
+        vr->is_using_strict_synchronized_afr() || vr->is_afw_rendering_method_selected(),
         vr->is_native_stereo_fix_enabled(),
         vr->is_splitscreen_compatibility_enabled(),
         vr->is_sceneview_compatibility_enabled());

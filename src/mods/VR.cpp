@@ -265,15 +265,32 @@ void WINAPI hk_ID3D12GraphicsCommandList_ResourceBarrier(ID3D12GraphicsCommandLi
                     vr->d3d12Renderer->CreateTexture(
                         desc.Width, desc.Height, desc.Format, D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE, vr->rawVelocityDesc[nEye], true);
                 }
-                static std::map<ID3D12Resource*, TextureDesc> rawVelocityDescMap;
-                if (!rawVelocityDescMap.contains(velocityCandidate)) {
-                    rawVelocityDescMap[velocityCandidate].pTexture = velocityCandidate;
-                    rawVelocityDescMap[velocityCandidate].initialState = D3D12_RESOURCE_STATE_RENDER_TARGET;
-                    vr->d3d12Renderer->SetupTextureDesc(rawVelocityDescMap[velocityCandidate]);
-                    // velocityCandidate->SetName(L"VelocityBuffer");
+                // UE5's transient allocator recycles resource pointers constantly, so an
+                // unbounded pointer->desc map leaks plugin descriptors. Keep a small ring
+                // and re-setup evicted entries in place so their srvPos/uavPos slots are reused.
+                struct VelocityDescEntry {
+                    ID3D12Resource* resource = nullptr;
+                    TextureDesc desc{};
+                };
+                static std::array<VelocityDescEntry, 8> rawVelocityDescRing{};
+                static size_t rawVelocityDescNext = 0;
+                VelocityDescEntry* entry = nullptr;
+                for (auto& e : rawVelocityDescRing) {
+                    if (e.resource == velocityCandidate) {
+                        entry = &e;
+                        break;
+                    }
+                }
+                if (entry == nullptr) {
+                    entry = &rawVelocityDescRing[rawVelocityDescNext];
+                    rawVelocityDescNext = (rawVelocityDescNext + 1) % rawVelocityDescRing.size();
+                    entry->resource = velocityCandidate;
+                    entry->desc.pTexture = velocityCandidate;
+                    entry->desc.initialState = D3D12_RESOURCE_STATE_RENDER_TARGET;
+                    vr->d3d12Renderer->SetupTextureDesc(entry->desc);
                 }
                 skip = true;
-                vr->d3d12Renderer->Copy(This, vr->rawVelocityDesc[nEye], rawVelocityDescMap[velocityCandidate]);
+                vr->d3d12Renderer->Copy(This, vr->rawVelocityDesc[nEye], entry->desc);
                 skip = false;
             }
             if (motionVectorsCandidate) {
@@ -3132,11 +3149,51 @@ std::optional<std::string> VR::clean_initialize() try {
 
     m_init_finished = true;
 
+    // The AFW hooks (device vtable patch, d3d12 ResourceBarrier/ClearDSV inline
+    // hooks, NGX inline hooks) are process-wide and hit every render thread, so
+    // only install them when AFW is the selected rendering method. Switching to
+    // AFW later installs them lazily from on_present().
+    if (g_framework->is_dx12() && m_rendering_method->value() == RenderingMethod::ALTERNATE_FRAMEWARP) {
+        m_afw_init_attempted = true;
+        initialize_afw();
+    } else {
+        spdlog::info("[VR] AFW rendering method not selected at init; skipping frame warp module hooks");
+    }
+
+    // all OK
+    return Mod::on_initialize();
+} catch(...) {
+    spdlog::error("Exception occurred in VR::on_initialize()");
+
+    m_runtime->error = "Exception occurred in VR::on_initialize()";
+    m_openxr->dll_missing = false;
+    m_openvr->dll_missing = false;
+    m_openxr->error = "Exception occurred in VR::on_initialize()";
+    m_openvr->error = "Exception occurred in VR::on_initialize()";
+    m_openvr->loaded = false;
+    m_openvr->is_hmd_active = false;
+    m_openxr->loaded = false;
+    m_init_finished = false;
+
+    return Mod::on_initialize();
+}
+
+void VR::initialize_afw() try {
     // #############################
     // #Frame Warp Module Start
     // #############################
-    if (!g_framework->is_dx12())
-        return Mod::on_initialize();
+    if (!g_framework->is_dx12()) {
+        return;
+    }
+
+    auto& hook = g_framework->get_d3d12_hook();
+    if (hook == nullptr || hook->get_device() == nullptr) {
+        spdlog::error("[VR] AFW init: D3D12 device not available yet");
+        m_afw_init_attempted = false; // retry on a later present
+        return;
+    }
+
+    spdlog::info("[VR] Initializing frame warp module (AFW)");
 
     if (GetModuleHandleW(L"PDAFWPlugin.dll") == nullptr) {
         const auto current_path = utility::get_module_directoryw(GetModuleHandleW(L"UEVRBackend.dll"));
@@ -3150,7 +3207,6 @@ std::optional<std::string> VR::clean_initialize() try {
 
     is_renderdoc = GetModuleHandleW(L"renderdoc.dll") != nullptr;
 
-    auto& hook = g_framework->get_d3d12_hook();
     hook->get_command_queue();
     pd::DeviceParams params{};
     params.d3d12Device = hook->get_device();
@@ -3170,14 +3226,14 @@ std::optional<std::string> VR::clean_initialize() try {
         auto result = safetyhook::InlineHook::create((LPVOID)origResourceBarrier, reinterpret_cast<void*>(hk_ID3D12GraphicsCommandList_ResourceBarrier));
         if (!result) {
             spdlog::error("Hook ID3D12GraphicsCommandList ResourceBarrier Failed! {}", (INT)result.error().type);
-            return Mod::on_initialize();
+            return;
         }
         ResourceBarrier_Hook = std::move(result.value());
 
         result = safetyhook::InlineHook::create((LPVOID)origClearDepthStencilView, reinterpret_cast<void*>(hk_ID3D12GraphicsCommandList_ClearDepthStencilView));
         if (!result) {
             spdlog::error("Hook ID3D12GraphicsCommandList ClearDepthStencilView Failed! {}", (INT)result.error().type);
-            return Mod::on_initialize();
+            return;
         }
         ClearDepthStencilView_Hook = std::move(result.value());
     }
@@ -3210,7 +3266,7 @@ std::optional<std::string> VR::clean_initialize() try {
             GetProcAddress(dllNGX, "NVSDK_NGX_D3D12_CreateFeature"), reinterpret_cast<void*>(hk_NVSDK_NGX_D3D12_CreateFeature));
         if (!result) {
             spdlog::error("Hook NVSDK_NGX_D3D12_CreateFeature Failed! {}", (INT)result.error().type);
-            return Mod::on_initialize();
+            return;
         }
         NVSDK_NGX_D3D12_CreateFeature_Hook = std::move(result.value());
 
@@ -3218,7 +3274,7 @@ std::optional<std::string> VR::clean_initialize() try {
             GetProcAddress(dllNGX, "NVSDK_NGX_D3D12_ReleaseFeature"), reinterpret_cast<void*>(hk_NVSDK_NGX_D3D12_ReleaseFeature));
         if (!result) {
             spdlog::error("Hook NVSDK_NGX_D3D12_ReleaseFeature Failed! {}", (INT)result.error().type);
-            return Mod::on_initialize();
+            return;
         }
         NVSDK_NGX_D3D12_ReleaseFeature_Hook = std::move(result.value());
 
@@ -3226,7 +3282,7 @@ std::optional<std::string> VR::clean_initialize() try {
             GetProcAddress(dllNGX, "NVSDK_NGX_D3D12_EvaluateFeature"), reinterpret_cast<void*>(hk_NVSDK_NGX_D3D12_EvaluateFeature));
         if (!result) {
             spdlog::error("Hook NVSDK_NGX_D3D12_EvaluateFeature Failed! {}", (INT)result.error().type);
-            return Mod::on_initialize();
+            return;
         }
         NVSDK_NGX_D3D12_EvaluateFeature_Hook = std::move(result.value());
     }
@@ -3235,22 +3291,9 @@ std::optional<std::string> VR::clean_initialize() try {
     // #Frame Warp Module End
     // #############################
 
-    // all OK
-    return Mod::on_initialize();
+    spdlog::info("[VR] Frame warp module (AFW) initialized");
 } catch(...) {
-    spdlog::error("Exception occurred in VR::on_initialize()");
-
-    m_runtime->error = "Exception occurred in VR::on_initialize()";
-    m_openxr->dll_missing = false;
-    m_openvr->dll_missing = false;
-    m_openxr->error = "Exception occurred in VR::on_initialize()";
-    m_openvr->error = "Exception occurred in VR::on_initialize()";
-    m_openvr->loaded = false;
-    m_openvr->is_hmd_active = false;
-    m_openxr->loaded = false;
-    m_init_finished = false;
-
-    return Mod::on_initialize();
+    spdlog::error("Exception occurred in VR::initialize_afw()");
 }
 
 std::optional<std::string> VR::initialize_openvr() {
@@ -4796,7 +4839,11 @@ void VR::record_hitch_snapshot_sample(std::chrono::steady_clock::time_point now)
     sample.sequence = ++m_hitch_snapshot_sequence;
     sample.frame_count = m_frame_count;
     sample.render_frame_count = m_render_frame_count;
-    sample.rendering_method = m_rendering_method != nullptr ? m_rendering_method->value() : -1;
+    // The compatibility policy's RenderingMethod enum uses 3 for SyntheticDibr; report
+    // AFW (VR::RenderingMethod value 3) as Alternating so diagnostics classify it as AFR.
+    sample.rendering_method = m_rendering_method == nullptr ? -1
+        : m_rendering_method->value() == RenderingMethod::ALTERNATE_FRAMEWARP ? (int)RenderingMethod::ALTERNATING
+        : m_rendering_method->value();
     sample.hmd_active = is_hmd_active();
     sample.runtime_loaded = get_runtime() != nullptr && get_runtime()->loaded;
     sample.runtime_ready = get_runtime() != nullptr && get_runtime()->ready();
@@ -8967,6 +9014,13 @@ void VR::on_present() {
     }
     if (GetAsyncKeyState(VK_MULTIPLY) == 0 && btnMul == true) {
         btnMul = false;
+    }
+
+    // Lazily bring up the frame warp module if AFW was selected after init.
+    if (d3d12Renderer == nullptr && !m_afw_init_attempted && g_framework->is_dx12() &&
+        m_rendering_method->value() == RenderingMethod::ALTERNATE_FRAMEWARP) {
+        m_afw_init_attempted = true;
+        initialize_afw();
     }
 
     update_camera_data(m_render_frame_count);

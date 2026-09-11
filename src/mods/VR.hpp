@@ -88,6 +88,11 @@ public:
     int last_update_camera_data_frame_count = 0;
     void update_camera_data(int frame_count);
 
+    // Installs the frame warp plugin + D3D12/NGX hooks. Called at init when AFW is
+    // the selected rendering method, or lazily from on_present when switched to later.
+    void initialize_afw();
+    bool m_afw_init_attempted = false;
+
     int get_render_frame_count() { return m_render_frame_count; };
     int get_vr_frame_count() { return m_frame_count; };
 
@@ -599,8 +604,15 @@ public:
     }
 
     bool is_using_afw() {
-        return m_rendering_method->value() == RenderingMethod::ALTERNATE_FRAMEWARP && afw_since_inject_frame_count >= 90 &&
+        // d3d12Renderer is only created when the frame warp hooks were installed at init.
+        return d3d12Renderer != nullptr &&
+               m_rendering_method->value() == RenderingMethod::ALTERNATE_FRAMEWARP && afw_since_inject_frame_count >= 90 &&
                afw_switching_skip_frames == 0 && afw_resolution_change_skip_frames == 0 && g_framework->is_dx12() && !is_using_2d_screen();
+    }
+
+    // True as soon as AFW is the selected method (before the 90-frame settle / API checks).
+    bool is_afw_rendering_method_selected() const {
+        return m_rendering_method->value() == RenderingMethod::ALTERNATE_FRAMEWARP;
     }
 
     bool is_using_afw_without_api_check() {
