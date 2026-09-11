@@ -265,9 +265,31 @@ bool is_stalker2_bulk_scene_component(sdk::USceneComponent* component) {
     return component_name.rfind(L"SceneComponent", 0) == 0;
 }
 
+// VirtualQuery is a syscall that contends with the allocator for the address-space lock.
+// During a level load on a 600k-object title the candidate guard issued ~10 of them per
+// object and the game thread spent 1-2s per tick adopting 8192 objects. Cache readable
+// regions per thread: UObjects live in large heap regions, so hit rates are very high.
+// Only positive results are cached (a region that later becomes unreadable is still
+// caught by the __try in safe_read_*; a stale negative would wrongly reject forever).
+struct ReadableRegionCacheEntry {
+    uintptr_t start{};
+    uintptr_t end{};
+};
+
+constexpr size_t READABLE_REGION_CACHE_SIZE = 64;
+
 bool is_readable_process_range(uintptr_t address, size_t size) {
     if (address == 0 || size == 0) {
         return false;
+    }
+
+    static thread_local ReadableRegionCacheEntry region_cache[READABLE_REGION_CACHE_SIZE]{};
+    static thread_local size_t region_cache_next{};
+
+    for (const auto& entry : region_cache) {
+        if (entry.end != 0 && address >= entry.start && size <= (entry.end - address)) {
+            return true;
+        }
     }
 
     MEMORY_BASIC_INFORMATION mbi{};
@@ -296,7 +318,13 @@ bool is_readable_process_range(uintptr_t address, size_t size) {
     const auto region_start = (uintptr_t)mbi.BaseAddress;
     const auto region_end = region_start + mbi.RegionSize;
 
-    return address >= region_start && address <= region_end && size <= (region_end - address);
+    if (address < region_start || address > region_end || size > (region_end - address)) {
+        return false;
+    }
+
+    region_cache[region_cache_next] = ReadableRegionCacheEntry{region_start, region_end};
+    region_cache_next = (region_cache_next + 1) % READABLE_REGION_CACHE_SIZE;
+    return true;
 }
 
 bool safe_read_uintptr(uintptr_t address, uintptr_t& value) {
@@ -2029,7 +2057,21 @@ void UObjectHook::refresh_new_objects_from_uobject_array(uint32_t max_objects) {
         candidates.resize(write_index);
     }
 
+    // Time-box the adoption work so a large post-load backlog is spread across ticks instead
+    // of stretching one frame by seconds. The cursor only advances past what was processed.
+    constexpr auto scan_time_budget = std::chrono::milliseconds{4};
+    const auto scan_start = std::chrono::steady_clock::now();
+    int32_t resume_cursor = end;
+    size_t processed = 0;
+
     for (const auto& candidate : candidates) {
+        if ((processed++ % 64) == 0 && processed > 1 &&
+            std::chrono::steady_clock::now() - scan_start > scan_time_budget) {
+            resume_cursor = candidate.index;
+            ++m_uobject_array_scan_stats.time_budget_cuts;
+            break;
+        }
+
         // Objects found directly through FUObjectArray must still pass layout and index validation.
         if (!is_safe_uobject_candidate(*this, candidate.object, true)) {
             ++rejected;
@@ -2041,7 +2083,9 @@ void UObjectHook::refresh_new_objects_from_uobject_array(uint32_t max_objects) {
         }
     }
 
-    m_uobject_array_scan_cursor = end;
+    m_uobject_array_scan_cursor = resume_cursor;
+    m_uobject_array_scan_stats.last_scan_ms =
+        (uint32_t)std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - scan_start).count();
     m_uobject_array_scan_stats.added += added;
     m_uobject_array_scan_stats.rejected += rejected;
     m_uobject_array_scan_stats.tombstone_skips += tombstone_skips;
@@ -2061,10 +2105,12 @@ void UObjectHook::refresh_new_objects_from_uobject_array(uint32_t max_objects) {
 
         if (now - last_log >= std::chrono::seconds(2)) {
             SPDLOG_INFO(
-                "[UObjectHook] Incrementally tracked {} UObjectArray objects (cursor {}/{})",
+                "[UObjectHook] Incrementally tracked {} UObjectArray objects (cursor {}/{}) in {} ms (budget cuts {})",
                 added,
                 m_uobject_array_scan_cursor,
-                object_count);
+                object_count,
+                m_uobject_array_scan_stats.last_scan_ms,
+                m_uobject_array_scan_stats.time_budget_cuts);
             last_log = now;
         }
     }

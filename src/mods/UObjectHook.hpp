@@ -319,7 +319,9 @@ private:
         uint64_t tombstone_skips{};
         uint64_t full_sweeps{};
         uint64_t persistent_tracking_misses{};
+        uint64_t time_budget_cuts{};
         uint32_t last_budget{};
+        uint32_t last_scan_ms{};
     } m_uobject_array_scan_stats{};
 
     struct AddObjectGuardStats {
