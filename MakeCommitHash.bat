@@ -1,5 +1,4 @@
 @echo off
-setlocal enabledelayedexpansion
 
 SET UEVR_UESDK_COMMIT_HASH=unknown
 SET UEVR_TRACKED_DIRTY=unknown
@@ -18,30 +17,20 @@ IF NOT ERRORLEVEL 1 (
 
 FOR /F "tokens=*" %%g IN ('git rev-parse HEAD') DO (SET UEVR_COMMIT_HASH=%%g)
 
+SET UEVR_TAG=
 FOR /F "tokens=*" %%t IN ('git describe --tags --always --abbrev^=0') DO (SET UEVR_TAG=%%t)
 IF "%UEVR_TAG%"=="" (SET UEVR_TAG=no_tag)
 
-FOR /F "tokens=*" %%d IN ('git describe --tags --always --long') DO (
-    set "src=%%d"
-    set cnt=0
-    for %%i in ("!src:-=" "!") do (
-        set /a cnt+=1
-    )
-	if !cnt!==3 (
-		FOR /F "tokens=1,2 delims=-" %%a IN ("%%d") DO (
-			SET UEVR_TAG_LONG=%%a
-			SET UEVR_COMMITS_PAST_TAG=%%b
-		)
-	)
-	if !cnt!==4 (
-		FOR /F "tokens=1,2,3 delims=-" %%a IN ("%%d") DO (
-			SET UEVR_TAG_LONG=%%a-%%b
-			SET UEVR_COMMITS_PAST_TAG=%%c
-		)
-	)
+REM Preserve the base-tag API value, or a short commit hash when no tag exists.
+SET UEVR_TAG_LONG=
+FOR /F "tokens=*" %%t IN ('git describe --tags --abbrev^=0 2^>nul') DO (SET UEVR_TAG_LONG=%%t)
+IF "%UEVR_TAG_LONG%"=="" (
+FOR /F "tokens=*" %%g IN ('git rev-parse --short HEAD 2^>nul') DO (SET UEVR_TAG_LONG=%%g)
 )
-
-IF "%UEVR_COMMITS_PAST_TAG%"=="" (SET UEVR_COMMITS_PAST_TAG=0)
+IF "%UEVR_TAG_LONG%"=="" (SET UEVR_TAG_LONG=no_tag)
+REM Count revisions directly: splitting git describe on '-' misreads tag names.
+SET UEVR_COMMITS_PAST_TAG=0
+FOR /F "tokens=*" %%n IN ('git rev-list --count "%UEVR_TAG%..HEAD" 2^>nul') DO (SET UEVR_COMMITS_PAST_TAG=%%n)
 
 FOR /F "tokens=*" %%b IN ('git rev-parse --abbrev-ref HEAD') DO (SET UEVR_BRANCH=%%b)
 

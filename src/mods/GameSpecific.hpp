@@ -22,6 +22,35 @@ inline std::wstring lowercase_path(std::wstring_view path) {
     return lowered;
 }
 
+inline bool is_dune_ue521_frame_handoff_runtime(
+    std::wstring_view path, uint32_t version_ms, uint32_t version_ls) {
+    const auto lowered = lowercase_path(path);
+    const auto separator = lowered.find_last_of(L"/\\");
+    const auto filename = std::wstring_view{lowered}.substr(
+        separator == std::wstring::npos ? 0 : separator + 1);
+    return filename == L"dunesandbox-win64-shipping.exe" &&
+        version_ms == 0x00050002 && version_ls == 0x00010000;
+}
+
+inline bool is_breathedge2_inventory_runtime(
+    std::wstring_view path, uint32_t file_version_ms, uint32_t file_version_ls, bool dx12) {
+    const auto lowered = lowercase_path(path);
+    const auto separator = lowered.find_last_of(L"/\\");
+    const auto filename = std::wstring_view{lowered}.substr(
+        separator == std::wstring::npos ? 0 : separator + 1);
+    return dx12 && file_version_ms == 0x00050007 && file_version_ls == 0x00040000 &&
+        filename == L"breathedge2-win64-shipping.exe";
+}
+
+inline bool is_halloween_ue574_dx12_runtime(
+    std::wstring_view path, uint32_t version_ms, uint32_t version_ls, bool dx12) {
+    const auto lowered = lowercase_path(path);
+    const auto separator = lowered.find_last_of(L"/\\");
+    const auto filename = std::wstring_view{lowered}.substr(
+        separator == std::wstring::npos ? 0 : separator + 1);
+    return dx12 && filename == L"halloween.exe" && version_ms == 0x00050007 && version_ls == 0x00040000;
+}
+
 inline bool should_use_stellar_blade_callable_renderer_entry(
     std::wstring_view path,
     bool ue426,
@@ -152,16 +181,64 @@ inline bool is_prospi_executable_path(std::wstring_view path) {
            lowered.find(L"prospi24-win64-shipping") != std::wstring::npos;
 }
 
+inline bool is_dune_awakening_gdk_executable_path(std::wstring_view path) {
+    const auto lowered = lowercase_path(path);
+    const auto separator = lowered.find_last_of(L"/\\");
+    const auto filename = std::wstring_view{lowered}.substr(
+        separator == std::wstring::npos ? 0 : separator + 1);
+    return filename == L"dunesandbox-wingdk-shipping.exe";
+}
+
 inline bool is_dune_awakening_executable_path(std::wstring_view path) {
     const auto lowered = lowercase_path(path);
     return lowered.find(L"dunesandbox-win64-shipping") != std::wstring::npos ||
-           lowered.find(L"duneawakening") != std::wstring::npos;
+           lowered.find(L"duneawakening") != std::wstring::npos ||
+           is_dune_awakening_gdk_executable_path(path);
+}
+
+inline bool is_dune_awakening_source_view_extension_path(std::wstring_view path) {
+    // GDK may try signature-validated guards, but its callback ABI is not yet
+    // validated. Keep the existing Win64 mappings separate from title detection.
+    return !is_dune_awakening_gdk_executable_path(path) &&
+           is_dune_awakening_executable_path(path);
 }
 
 inline bool is_mechwarrior_clans_executable_path(std::wstring_view path) {
     const auto lowered = lowercase_path(path);
     return lowered.find(L"mechwarrior-win64-shipping") != std::wstring::npos ||
            lowered.find(L"mw5clans") != std::wstring::npos;
+}
+
+inline bool is_borderlands4_executable_path(std::wstring_view path) {
+    const auto lowered = lowercase_path(path);
+    return lowered.ends_with(L"\\borderlands4.exe") ||
+           lowered.ends_with(L"/borderlands4.exe") ||
+           lowered == L"borderlands4.exe";
+}
+
+inline bool should_use_borderlands4_ue554_dedicated_ui_target(
+    std::wstring_view path,
+    std::wstring_view detected_version,
+    uint32_t file_version_ms,
+    uint32_t file_version_ls,
+    bool dx12) {
+    if (!dx12 || !is_borderlands4_executable_path(path)) {
+        return false;
+    }
+
+    if (detected_version == L"5.5.4") {
+        return true;
+    }
+
+    // The embedded branch scanner can report only the minor version. Require
+    // the exact file-version patch in that case, never a conflicting UE version.
+    if (!detected_version.empty() && detected_version != L"0.00" &&
+        detected_version != L"unknown" && detected_version != L"5.5") {
+        return false;
+    }
+
+    // The low word is the build revision: 5.5.4.1 still uses the 5.5.4 gate.
+    return file_version_ms == 0x00050005 && (file_version_ls >> 16) == 4;
 }
 
 inline bool is_daysgone_executable_path(std::wstring_view path) {
