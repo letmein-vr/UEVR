@@ -209,6 +209,113 @@ std::optional<uintptr_t> find_townfall_object_allocator() {
     return start;
 }
 
+struct ObjectFreeSite {
+    uintptr_t address{};
+    uint32_t object_register{};
+};
+
+// Townfall never runs a standalone ~UObjectBase, so the destructor hook misses almost
+// every GC'd object. GC releases array slots through a copy of FreeUObjectIndex inlined
+// into FObjectPurge::DestroyObjects (plus the real one, used by StaticAllocateObject's
+// in-place reuse). Every copy opens with the "index points to a different object" fatal
+// check; the instruction that check jumps to still has the dying UObject in a callee-saved
+// register, before its slot is cleared and long before its memory is freed.
+std::vector<ObjectFreeSite> find_townfall_object_free_sites() {
+    const auto executable = utility::get_executable();
+    const auto matches = utility::scan_strings(executable,
+        std::wstring{L"Removing object (0x%016llx) at index %d but the index points to a different object"});
+    if (matches.size() != 1) {
+        SPDLOG_WARN("[Townfall][UObjectHook] FreeUObjectIndex diagnostic not unique ({} matches)", matches.size());
+        return {};
+    }
+
+    std::vector<ObjectFreeSite> sites{};
+
+    for (const auto reference : utility::scan_displacement_references(executable, matches.front())) {
+        const auto lea = utility::resolve_instruction(reference);
+        if (!lea || std::string_view{lea->instrux.Mnemonic} != "LEA") {
+            continue;
+        }
+
+        // The fatal call gets the object in R9; the call's fall-through is the resume point.
+        std::optional<uint32_t> object_register{};
+        std::optional<uintptr_t> after_call{};
+        auto ip = lea->addr;
+
+        for (size_t i = 0; i < 12 && !after_call; ++i) {
+            const auto insn = utility::decode_one((uint8_t*)ip);
+            if (!insn) {
+                break;
+            }
+
+            const std::string_view mnemonic{insn->Mnemonic};
+            const auto& dst = insn->Operands[0];
+            const auto& src = insn->Operands[1];
+
+            if (mnemonic == "MOV" && dst.Type == ND_OP_REG && dst.Info.Register.Type == ND_REG_GPR &&
+                dst.Info.Register.Reg == NDR_R9 && dst.Size == 8 &&
+                src.Type == ND_OP_REG && src.Info.Register.Type == ND_REG_GPR) {
+                object_register = src.Info.Register.Reg;
+            } else if (mnemonic.starts_with("CALL")) {
+                after_call = ip + insn->Length;
+            }
+
+            ip += insn->Length;
+        }
+
+        if (!object_register || !after_call) {
+            SPDLOG_WARN("[Townfall][UObjectHook] FreeUObjectIndex site at {:x} has unexpected shape", lea->addr);
+            continue;
+        }
+
+        // Only callee-saved registers survive the (skipped) fatal call unchanged.
+        switch (*object_register) {
+        case NDR_RBX: case NDR_RBP: case NDR_RSI: case NDR_RDI:
+        case NDR_R12: case NDR_R13: case NDR_R14: case NDR_R15:
+            break;
+        default:
+            SPDLOG_WARN("[Townfall][UObjectHook] FreeUObjectIndex site at {:x} uses volatile register {}", lea->addr, *object_register);
+            continue;
+        }
+
+        // The slot-matches branch must be a short jcc straight over the fatal block.
+        bool skipped_by_branch{};
+        for (uintptr_t back = 2; back <= 0x40 && !skipped_by_branch; ++back) {
+            const auto p = lea->addr - back;
+            const auto opcode = *(uint8_t*)p;
+            skipped_by_branch = opcode >= 0x70 && opcode <= 0x7F && p + 2 + *(int8_t*)(p + 1) == *after_call;
+        }
+
+        if (!skipped_by_branch) {
+            SPDLOG_WARN("[Townfall][UObjectHook] FreeUObjectIndex site at {:x} has no matching skip branch", lea->addr);
+            continue;
+        }
+
+        sites.push_back({*after_call, *object_register});
+    }
+
+    return sites;
+}
+
+template <uintptr_t safetyhook::Context::*Register>
+void on_townfall_object_free(safetyhook::Context& ctx) {
+    UObjectHook::notify_object_index_freed(reinterpret_cast<sdk::UObjectBase*>(ctx.*Register));
+}
+
+safetyhook::MidHookFn get_townfall_object_free_callback(uint32_t object_register) {
+    switch (object_register) {
+    case NDR_RBX: return &on_townfall_object_free<&safetyhook::Context::rbx>;
+    case NDR_RBP: return &on_townfall_object_free<&safetyhook::Context::rbp>;
+    case NDR_RSI: return &on_townfall_object_free<&safetyhook::Context::rsi>;
+    case NDR_RDI: return &on_townfall_object_free<&safetyhook::Context::rdi>;
+    case NDR_R12: return &on_townfall_object_free<&safetyhook::Context::r12>;
+    case NDR_R13: return &on_townfall_object_free<&safetyhook::Context::r13>;
+    case NDR_R14: return &on_townfall_object_free<&safetyhook::Context::r14>;
+    case NDR_R15: return &on_townfall_object_free<&safetyhook::Context::r15>;
+    default: return nullptr;
+    }
+}
+
 bool is_ue_5_1_uobjecthook_guard_enabled() {
     static const bool is_ue_5_1 = []() {
         const auto disk_version = sdk::get_file_version_info();
@@ -1110,6 +1217,14 @@ void UObjectHook::hook() {
         return;
     }
 
+    if (is_townfall_ue56_uobjecthook()) {
+        install_object_free_hooks();
+
+        // Safety net for anything freed through a path the free hooks don't cover.
+        m_validate_tracked_identity.store(true, std::memory_order_relaxed);
+        SPDLOG_INFO("[Townfall][UObjectHook] Tracked-object identity validation enabled");
+    }
+
     // The Outer Worlds 2: AddObject discovery lands on an unrelated per-object helper whose
     // RCX is a fixed global, so the guarded hook never yields a reliable register. Worse,
     // stray stack slots occasionally validate, which keeps the "unreliable" fallback from
@@ -1522,7 +1637,7 @@ void* UObjectHook::process_event_hook(sdk::UObject* obj, sdk::UFunction* func, v
 bool UObjectHook::add_new_object(sdk::UObjectBase* object, bool run_creation_jobs, bool candidate_already_validated) {
     if (!candidate_already_validated) {
         std::shared_lock _{m_mutex};
-        if (exists_unsafe(object)) {
+        if (exists_unsafe(object) && is_tracked_identity_current_unsafe(object)) {
             return false;
         }
     }
@@ -1539,7 +1654,14 @@ bool UObjectHook::add_new_object(sdk::UObjectBase* object, bool run_creation_job
     std::unique_lock _{m_mutex};
 
     if (exists_unsafe(object)) {
-        return false;
+        if (is_tracked_identity_current_unsafe(object)) {
+            return false;
+        }
+
+        // A new object took the address of one that was freed without us noticing;
+        // drop the stale entry (old class chain) before registering the new one.
+        // No tombstone: the slot identity now belongs to the new object.
+        remove_tracked_object_unsafe(object, false);
     }
 
     std::unique_ptr<MetaObject> meta_object{};
@@ -1579,6 +1701,7 @@ bool UObjectHook::add_new_object(sdk::UObjectBase* object, bool run_creation_job
     meta_object->uclass = c;
 
     const auto object_identity = get_uobject_index_serial(object);
+    meta_object->internal_index = object_identity ? object_identity->first : -1;
     std::erase_if(m_most_recent_objects, [object](const auto& recent) {
         return recent.object == object;
     });
@@ -6734,71 +6857,147 @@ void* UObjectHook::add_object(void* rcx, void* rdx, void* r8, void* r9, void* st
     return result;
 }
 
+void UObjectHook::remove_tracked_object_unsafe(sdk::UObjectBase* object, bool record_tombstone) {
+    auto it = m_meta_objects.find(object);
+
+    if (it == m_meta_objects.end()) {
+        return;
+    }
+
+    ++m_debug.destructor_calls;
+
+#ifdef VERBOSE_UOBJECTHOOK
+    SPDLOG_INFO("Removing object {:x} {:s}", (uintptr_t)object, utility::narrow(it->second->full_name));
+#endif
+    if (record_tombstone &&
+        (should_incrementally_refresh_uobject_array() ||
+         m_force_uobject_array_creation_scan.load(std::memory_order_relaxed) ||
+         m_add_object_guard_unreliable.load(std::memory_order_relaxed)))
+    {
+        if (const auto index_serial = get_uobject_index_serial(object); index_serial.has_value()) {
+            m_destroyed_object_tombstones[object] = UObjectHook::DestroyedObjectTombstone{
+                index_serial->first,
+                index_serial->second,
+                std::chrono::steady_clock::now()
+            };
+        }
+    }
+
+    m_objects.erase(object);
+    std::erase_if(m_most_recent_objects, [object](const auto& recent) {
+        return recent.object == object;
+    });
+    m_motion_controller_attached_components.erase((sdk::USceneComponent*)object);
+    m_spawned_spheres.erase((sdk::USceneComponent*)object);
+    m_spawned_spheres_to_components.erase((sdk::USceneComponent*)object);
+    m_components_with_spheres.erase((sdk::USceneComponent*)object);
+
+    if (object == m_overlap_detection_actor) {
+        m_overlap_detection_actor = nullptr;
+    }
+
+    if (object == m_overlap_detection_actor_left) {
+        m_overlap_detection_actor_left = nullptr;
+    }
+
+    if (object == m_camera_attach.object) {
+        m_camera_attach.object = nullptr;
+    }
+
+    /*for (auto super = (sdk::UStruct*)it->second->uclass; super != nullptr;) {
+        m_objects_by_class[(sdk::UClass*)super].erase(object);
+
+        // Just make sure we don't do any operations on super because it might be invalid...
+        if (!m_objects.contains(super)) {
+            SPDLOG_ERROR("Super for {:x} is not valid", (uintptr_t)object);
+            break;
+        }
+
+        super = super->get_super_struct();
+    }*/
+
+    for (auto super : it->second->super_classes) {
+        m_objects_by_class[super].erase(object);
+    }
+
+    m_reusable_meta_objects.push_back(std::move(it->second));
+    m_meta_objects.erase(object);
+}
+
+bool UObjectHook::is_tracked_identity_current_slow_unsafe(sdk::UObjectBase* object) const {
+    const auto it = m_meta_objects.find(object);
+
+    if (it == m_meta_objects.end() || it->second == nullptr) {
+        return false;
+    }
+
+    const auto index = it->second->internal_index;
+
+    if (index < 0) {
+        return true; // identity unknown at registration; keep the old behavior
+    }
+
+    auto object_array = sdk::FUObjectArray::get();
+
+    if (object_array == nullptr) {
+        return true;
+    }
+
+    if (index >= object_array->get_object_count()) {
+        return false;
+    }
+
+    // Only the array is read until it proves the object is alive; the object's own
+    // memory may already be freed or reused.
+    const auto item = object_array->get_object(index);
+    uintptr_t item_object{};
+
+    if (item == nullptr ||
+        !safe_read_uintptr((uintptr_t)item + sdk::FUObjectArray::get_item_object_offset(), item_object) ||
+        item_object != (uintptr_t)object) {
+        return false;
+    }
+
+    return object->get_class() == it->second->uclass;
+}
+
+void UObjectHook::notify_object_index_freed(sdk::UObjectBase* object) {
+    auto& hook = UObjectHook::get();
+    std::unique_lock _{hook->m_mutex};
+    hook->remove_tracked_object_unsafe(object);
+}
+
+bool UObjectHook::install_object_free_hooks() {
+    const auto sites = find_townfall_object_free_sites();
+
+    for (const auto& site : sites) {
+        const auto callback = get_townfall_object_free_callback(site.object_register);
+        auto hook = callback != nullptr ? safetyhook::create_mid((void*)site.address, callback) : safetyhook::MidHook{};
+
+        if (!hook) {
+            SPDLOG_ERROR("[Townfall][UObjectHook] Failed to hook FreeUObjectIndex site {:x}", site.address);
+            continue;
+        }
+
+        SPDLOG_INFO("[Townfall][UObjectHook] Hooked FreeUObjectIndex site {:x} (object in register {})",
+            site.address, site.object_register);
+        m_object_free_hooks.push_back(std::move(hook));
+    }
+
+    if (m_object_free_hooks.empty()) {
+        SPDLOG_WARN("[Townfall][UObjectHook] No FreeUObjectIndex sites hooked; relying on identity validation");
+        return false;
+    }
+
+    return true;
+}
+
 void* UObjectHook::destructor(sdk::UObjectBase* object, void* rdx, void* r8, void* r9) {
     auto& hook = UObjectHook::get();
 
     {
         std::unique_lock _{hook->m_mutex};
-
-        if (auto it = hook->m_meta_objects.find(object); it != hook->m_meta_objects.end()) {
-            ++hook->m_debug.destructor_calls;
-
-#ifdef VERBOSE_UOBJECTHOOK
-            SPDLOG_INFO("Removing object {:x} {:s}", (uintptr_t)object, utility::narrow(it->second->full_name));
-#endif
-            if (should_incrementally_refresh_uobject_array() ||
-                hook->m_force_uobject_array_creation_scan.load(std::memory_order_relaxed) ||
-                hook->m_add_object_guard_unreliable.load(std::memory_order_relaxed))
-            {
-                if (const auto index_serial = get_uobject_index_serial(object); index_serial.has_value()) {
-                    hook->m_destroyed_object_tombstones[object] = UObjectHook::DestroyedObjectTombstone{
-                        index_serial->first,
-                        index_serial->second,
-                        std::chrono::steady_clock::now()
-                    };
-                }
-            }
-
-            hook->m_objects.erase(object);
-            std::erase_if(hook->m_most_recent_objects, [object](const auto& recent) {
-                return recent.object == object;
-            });
-            hook->m_motion_controller_attached_components.erase((sdk::USceneComponent*)object);
-            hook->m_spawned_spheres.erase((sdk::USceneComponent*)object);
-            hook->m_spawned_spheres_to_components.erase((sdk::USceneComponent*)object);
-            hook->m_components_with_spheres.erase((sdk::USceneComponent*)object);
-
-            if (object == hook->m_overlap_detection_actor) {
-                hook->m_overlap_detection_actor = nullptr;
-            }
-
-            if (object == hook->m_overlap_detection_actor_left) {
-                hook->m_overlap_detection_actor_left = nullptr;
-            }
-
-            if (object == hook->m_camera_attach.object) {
-                hook->m_camera_attach.object = nullptr;
-            }
-
-            /*for (auto super = (sdk::UStruct*)it->second->uclass; super != nullptr;) {
-                hook->m_objects_by_class[(sdk::UClass*)super].erase(object);
-
-                // Just make sure we don't do any operations on super because it might be invalid...
-                if (!hook->m_objects.contains(super)) {
-                    SPDLOG_ERROR("Super for {:x} is not valid", (uintptr_t)object);
-                    break;
-                }
-
-                super = super->get_super_struct();
-            }*/
-
-            for (auto super : it->second->super_classes) {
-                hook->m_objects_by_class[super].erase(object);
-            }
-
-            hook->m_reusable_meta_objects.push_back(std::move(it->second));
-            hook->m_meta_objects.erase(object);
-        }
+        hook->remove_tracked_object_unsafe(object);
     }
 
     auto result = hook->m_destructor_hook.unsafe_call<void*>(object, rdx, r8, r9);

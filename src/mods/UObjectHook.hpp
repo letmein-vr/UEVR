@@ -41,7 +41,22 @@ public:
     std::unordered_set<sdk::UObjectBase*> get_objects_by_class(sdk::UClass* uclass) const {
         std::shared_lock _{m_mutex};
         if (auto it = m_objects_by_class.find(uclass); it != m_objects_by_class.end()) {
-            return it->second;
+            if (!m_validate_tracked_identity.load(std::memory_order_relaxed)) {
+                return it->second;
+            }
+
+            // Drop entries whose FUObjectArray slot no longer holds them (freed without
+            // us seeing it); their memory may already belong to an unrelated object.
+            std::unordered_set<sdk::UObjectBase*> current{};
+            current.reserve(it->second.size());
+
+            for (auto object : it->second) {
+                if (is_tracked_identity_current_unsafe(object)) {
+                    current.insert(object);
+                }
+            }
+
+            return current;
         }
 
         return {};
@@ -49,7 +64,7 @@ public:
 
     bool exists(sdk::UObjectBase* object) const {
         std::shared_lock _{m_mutex};
-        return exists_unsafe(object);
+        return exists_unsafe(object) && is_tracked_identity_current_unsafe(object);
     }
 
     bool all_exist(sdk::UObjectBase* const* objects, size_t count) const {
@@ -59,13 +74,16 @@ public:
 
         std::shared_lock _{m_mutex};
         for (size_t i = 0; i < count; ++i) {
-            if (objects[i] == nullptr || !exists_unsafe(objects[i])) {
+            if (objects[i] == nullptr || !exists_unsafe(objects[i]) || !is_tracked_identity_current_unsafe(objects[i])) {
                 return false;
             }
         }
 
         return true;
     }
+
+    // Called from the Townfall FUObjectArray free-slot hooks while the slot still holds the object.
+    static void notify_object_index_freed(sdk::UObjectBase* object);
 
     void activate();
 
@@ -202,6 +220,17 @@ private:
         return m_objects.contains(object);
     }
 
+    // True when identity validation is off, or the object's registered FUObjectArray
+    // slot still holds this pointer with the class it was registered with.
+    bool is_tracked_identity_current_unsafe(sdk::UObjectBase* object) const {
+        return !m_validate_tracked_identity.load(std::memory_order_relaxed) ||
+            is_tracked_identity_current_slow_unsafe(object);
+    }
+
+    bool is_tracked_identity_current_slow_unsafe(sdk::UObjectBase* object) const;
+    void remove_tracked_object_unsafe(sdk::UObjectBase* object, bool record_tombstone = true);
+    bool install_object_free_hooks();
+
     void hook();
     bool add_new_object(sdk::UObjectBase* object, bool run_creation_jobs = true, bool candidate_already_validated = false);
     bool try_track_reachable_ui_object(sdk::UObjectBase* parent, sdk::UObjectBase* child, std::string_view context);
@@ -268,6 +297,7 @@ private:
     bool m_wants_activate{false};
     bool m_add_object_hooked{false};
     std::atomic_bool m_townfall_allocator_valid{false};
+    std::atomic_bool m_validate_tracked_identity{false};
     std::atomic_bool m_force_uobject_array_creation_scan{false};
     std::atomic_bool m_add_object_guard_unreliable{false};
     std::atomic_bool m_stalker2_uobject_full_scan_requested{false};
@@ -289,6 +319,7 @@ private:
         std::wstring full_name{};
         sdk::UClass* uclass{nullptr};
         std::vector<sdk::UClass*> super_classes{};
+        int32_t internal_index{-1}; // FUObjectArray slot at registration, -1 if unknown
     };
 
     std::unordered_set<sdk::UObjectBase*> m_objects{};
@@ -299,6 +330,7 @@ private:
 
     SafetyHookInline m_add_object_hook{};
     SafetyHookInline m_destructor_hook{};
+    std::vector<safetyhook::MidHook> m_object_free_hooks{};
 
     std::chrono::steady_clock::time_point m_last_sort_time{};
     std::vector<sdk::UClass*> m_sorted_classes{};
