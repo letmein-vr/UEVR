@@ -2,7 +2,9 @@
 
 #include <filesystem>
 #include <chrono>
+#include <mutex>
 #include <shared_mutex>
+#include <string>
 #include <unordered_set>
 #include <unordered_map>
 #include <memory>
@@ -245,6 +247,7 @@ private:
     void refresh_new_objects_from_uobject_array(uint32_t max_objects = 4096);
     uint32_t get_uobject_array_scan_budget(sdk::UGameEngine* engine);
     void mark_persistent_tracking_miss();
+    std::string get_expanded_object_name(sdk::UObject* object);
     void prune_destroyed_object_tombstones(std::chrono::steady_clock::time_point now);
     bool is_stalker2_bulk_scene_path(const StatePath& path) const;
     void request_stalker2_uobject_full_scan();
@@ -322,7 +325,25 @@ private:
         uint64_t time_budget_cuts{};
         uint32_t last_budget{};
         uint32_t last_scan_ms{};
+        uint64_t persistent_miss_rearms{};
     } m_uobject_array_scan_stats{};
+
+    // Cache of "ClassName ObjectName" strings used by persistent path resolution.
+    struct ExpandedNameCacheEntry {
+        int32_t name_index{};
+        int32_t name_number{};
+        sdk::UClass* klass{};
+        std::string expanded{};
+    };
+
+    static constexpr size_t EXPANDED_NAME_CACHE_LIMIT = 16384;
+    static constexpr auto PERSISTENT_MISS_REARM_INTERVAL = std::chrono::seconds(60);
+
+    std::mutex m_expanded_name_cache_mutex{};
+    std::unordered_map<sdk::UObject*, ExpandedNameCacheEntry> m_expanded_name_cache{};
+    bool m_persistent_miss_active{false};
+    bool m_uobject_array_scan_high_priority{false};
+    std::chrono::steady_clock::time_point m_persistent_miss_episode_start{};
 
     struct AddObjectGuardStats {
         std::atomic<uint64_t> valid_candidate_calls{};

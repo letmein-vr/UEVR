@@ -283,6 +283,7 @@ private:
 private:
     void draw_ui();
     void draw_about();
+    void draw_frame_profiler();
 
     bool hook_d3d11();
     bool hook_d3d12();

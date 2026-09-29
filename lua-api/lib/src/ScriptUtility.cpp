@@ -1,14 +1,52 @@
 #include <format>
 #include <string>
 #include <cstdint>
+#include <mutex>
+#include <shared_mutex>
+#include <unordered_map>
 
 #include <utility/String.hpp>
 
 #include <datatypes/Vector.hpp>
 #include <datatypes/StructObject.hpp>
 #include <ScriptUtility.hpp>
+#include <FrameProfiler.hpp>
 
 namespace lua::utility {
+// FName -> string, memoized by the name's (comparison index, number) pair.
+// Every property read and every UFunction call from Lua used to convert the
+// property's class name (and the parameter names) through the game's FName
+// pool, two cross-API calls plus an allocation each, on every access. A name
+// entry never changes for the life of the process, so the string is cached.
+// (Only the two int32s of a non-case-preserving FName are used as the key;
+// shipping builds do not use case-preserving names.)
+static const std::wstring& fname_str(const uevr::API::FName* name) {
+    static std::shared_mutex mtx{};
+    static std::unordered_map<uint64_t, std::wstring> cache{};
+    static const std::wstring empty{};
+
+    if (name == nullptr) {
+        return empty;
+    }
+
+    const uint64_t key = ((uint64_t)(uint32_t)name->comparison_index << 32) | (uint64_t)(uint32_t)name->number;
+
+    {
+        std::shared_lock _{mtx};
+
+        if (const auto it = cache.find(key); it != cache.end()) {
+            return it->second;
+        }
+    }
+
+    auto str = name->to_string();
+
+    std::unique_lock _{mtx};
+    // References into an unordered_map stay valid across rehashes (node-based), so returning a
+    // reference to the stored string is safe as long as entries are never erased, which they aren't.
+    return cache.emplace(key, std::move(str)).first->second;
+}
+
 sol::object call_function(sol::this_state s, uevr::API::UObject* self, uevr::API::UFunction* fn, sol::variadic_args args);
 
 uevr::API::UClass* as_uclass_object(uevr::API::UObject* object) {
@@ -67,7 +105,7 @@ sol::object prop_to_object(sol::this_state s, void* self, uevr::API::FProperty* 
         return sol::make_object(s, sol::lua_nil);
     }
 
-    const auto name_hash = ::utility::hash(propc->get_fname()->to_string());
+    const auto name_hash = ::utility::hash(fname_str(propc->get_fname()));
     const auto offset = desc->get_offset();
 
     switch (name_hash) {
@@ -112,7 +150,7 @@ sol::object prop_to_object(sol::this_state s, void* self, uevr::API::FProperty* 
             return sol::make_object(s, sol::lua_nil);
         }
 
-        const auto np_name_hash = ::utility::hash(np_c->get_fname()->to_string());
+        const auto np_name_hash = ::utility::hash(fname_str(np_c->get_fname()));
 
         switch (np_name_hash) {
         case L"FloatProperty"_fnv:
@@ -214,7 +252,7 @@ sol::object prop_to_object(sol::this_state s, void* self, uevr::API::FProperty* 
             return sol::make_object(s, sol::lua_nil);
         }
 
-        const auto inner_name_hash = ::utility::hash(inner_c->get_fname()->to_string());
+        const auto inner_name_hash = ::utility::hash(fname_str(inner_c->get_fname()));
 
         switch (inner_name_hash) {
         case L"InterfaceProperty"_fnv:
@@ -307,10 +345,10 @@ void set_property(sol::this_state s, void* self, uevr::API::UStruct* owner_c, ue
     const auto propc = desc->get_class();
 
     if (propc == nullptr) {
-        throw sol::error(std::format("[set_property] Property '{}' has no class", ::utility::narrow(desc->get_fname()->to_string())));
+        throw sol::error(std::format("[set_property] Property '{}' has no class", ::utility::narrow(fname_str(desc->get_fname()))));
     }
 
-    const auto name_hash = ::utility::hash(propc->get_fname()->to_string());
+    const auto name_hash = ::utility::hash(fname_str(propc->get_fname()));
     const auto offset = desc->get_offset();
 
     switch (name_hash) {
@@ -366,7 +404,7 @@ void set_property(sol::this_state s, void* self, uevr::API::UStruct* owner_c, ue
             throw sol::error("Enum property's underlying property has no class");
         }
 
-        const auto np_name_hash = ::utility::hash(np_c->get_fname()->to_string());
+        const auto np_name_hash = ::utility::hash(fname_str(np_c->get_fname()));
 
         switch (np_name_hash) {
         case L"FloatProperty"_fnv:
@@ -510,7 +548,7 @@ void set_property(sol::this_state s, void* self, uevr::API::UStruct* owner_c, ue
                 const auto prop = struct_desc->find_property(key.as<std::wstring>().c_str());
 
                 if (prop == nullptr) {
-                    throw sol::error(std::format("Struct property '{}' not found in {}", ::utility::narrow(key.as<std::wstring>()), ::utility::narrow(struct_desc->get_fname()->to_string())));
+                    throw sol::error(std::format("Struct property '{}' not found in {}", ::utility::narrow(key.as<std::wstring>()), ::utility::narrow(fname_str(struct_desc->get_fname()))));
                 }
 
                 set_property(s, (void*)((uintptr_t)self + offset), struct_desc, prop, val, dynamic_strings);
@@ -520,9 +558,9 @@ void set_property(sol::this_state s, void* self, uevr::API::UStruct* owner_c, ue
 
             if (arg.desc != struct_desc) {
                 if (arg.desc != nullptr) {
-                    throw sol::error(std::format("Invalid struct type for struct property (expected {}, got {})", ::utility::narrow(struct_desc->get_fname()->to_string()), ::utility::narrow(arg.desc->get_fname()->to_string())));
+                    throw sol::error(std::format("Invalid struct type for struct property (expected {}, got {})", ::utility::narrow(fname_str(struct_desc->get_fname())), ::utility::narrow(fname_str(arg.desc->get_fname()))));
                 } else {
-                    throw sol::error(std::format("Invalid struct type for struct property (expected {})", ::utility::narrow(struct_desc->get_fname()->to_string())));
+                    throw sol::error(std::format("Invalid struct type for struct property (expected {})", ::utility::narrow(fname_str(struct_desc->get_fname()))));
                 }
             }
 
@@ -572,6 +610,9 @@ sol::object call_function(sol::this_state s, uevr::API::UObject* self, uevr::API
     if (fn == nullptr) {
         return sol::make_object(s, sol::lua_nil);
     }
+
+    // Whole Lua->UFunction call (argument marshalling + engine call + out-param unmarshalling).
+    UEVR_PERF_SCOPE("lua UFunction calls (total incl. marshalling)");
 
     auto call_target = self;
 
@@ -624,14 +665,14 @@ sol::object call_function(sol::this_state s, uevr::API::UObject* self, uevr::API
             continue;
         }
 
-        const auto arg_c_name = arg_c->get_fname()->to_string();
+        const auto arg_c_name = fname_str(arg_c->get_fname());
 
         if (!arg_c_name.contains(L"Property")) {
             continue;
         }
 
         const auto prop_desc = (uevr::API::FProperty*)arg_desc;
-        const auto prop_name = prop_desc->get_fname()->to_string();
+        const auto prop_name = fname_str(prop_desc->get_fname());
         const auto is_return_value = prop_desc->is_return_param() || prop_name == L"ReturnValue";
 
         if (is_return_value) {
@@ -713,7 +754,7 @@ sol::object call_function(sol::this_state s, uevr::API::UObject* self, uevr::API
                 continue;
             }
 
-            const auto inner_name_hash = ::utility::hash(inner_c->get_fname()->to_string());
+            const auto inner_name_hash = ::utility::hash(fname_str(inner_c->get_fname()));
 
             switch (inner_name_hash) {
             case L"InterfaceProperty"_fnv:
@@ -759,12 +800,15 @@ sol::object call_function(sol::this_state s, uevr::API::UObject* self, uevr::API
         }
     }
 
-    fn->call(call_target, params.data());
+    {
+        UEVR_PERF_SCOPE("lua UFunction calls (engine execution only)");
+        fn->call(call_target, params.data());
+    }
 
     // Handle out parameters
     for (const auto& [prop, arg_index] : prop_to_arg_index) {
         const auto prop_c = prop->get_class();
-        const auto prop_name_hash = ::utility::hash(prop_c->get_fname()->to_string());
+        const auto prop_name_hash = ::utility::hash(fname_str(prop_c->get_fname()));
         
         if (args[arg_index].is<lua::datatypes::StructObject>()) {
             if (prop_name_hash != L"StructProperty"_fnv) {
@@ -777,9 +821,9 @@ sol::object call_function(sol::this_state s, uevr::API::UObject* self, uevr::API
 
             if (structprop->get_struct() != arg.desc) {
                 if (arg.desc != nullptr) {
-                    throw sol::error(std::format("Invalid struct type for out parameter (expected {}, got {})", ::utility::narrow(prop_c->get_fname()->to_string()), ::utility::narrow(arg.desc->get_fname()->to_string())));
+                    throw sol::error(std::format("Invalid struct type for out parameter (expected {}, got {})", ::utility::narrow(fname_str(prop_c->get_fname())), ::utility::narrow(fname_str(arg.desc->get_fname()))));
                 } else {
-                    throw sol::error(std::format("Invalid struct type for out parameter (expected {})", ::utility::narrow(prop_c->get_fname()->to_string())));
+                    throw sol::error(std::format("Invalid struct type for out parameter (expected {})", ::utility::narrow(fname_str(prop_c->get_fname()))));
                 }
             }
 
@@ -809,7 +853,7 @@ sol::object call_function(sol::this_state s, uevr::API::UObject* self, uevr::API
         } else if (args[args_index].is<sol::nil_t>()) {
             // Do nothing
         } else {
-            throw sol::error(std::format("Invalid argument type for argument {} ({})", arg_index, ::utility::narrow(prop_c->get_fname()->to_string())));
+            throw sol::error(std::format("Invalid argument type for argument {} ({})", arg_index, ::utility::narrow(fname_str(prop_c->get_fname()))));
         }
     }
 
@@ -834,7 +878,7 @@ sol::object call_function(sol::this_state s, uevr::API::UObject* self, uevr::API
                 return result;
             }
 
-            const auto inner_name_hash = ::utility::hash(inner_c->get_fname()->to_string());
+            const auto inner_name_hash = ::utility::hash(fname_str(inner_c->get_fname()));
 
             switch (inner_name_hash) {
             case L"InterfaceProperty"_fnv:

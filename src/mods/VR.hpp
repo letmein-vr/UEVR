@@ -85,6 +85,13 @@ public:
     MatrixPair render_projection_matrix[2]{};
     int last_update_matrix_frame_count[2] = {0, 0};
 
+    // Origin the AFW view matrices are expressed relative to. Re-based whenever the
+    // camera drifts >100 m from it so large world coordinates (Stalker 2) don't lose
+    // float precision in the matrices handed to PDAFWPlugin, which showed up as
+    // hand/gun jitter. Restores PureDark's beta.5 fix (3fccbb6), later removed in
+    // fc8de10; kept in double so the subtraction happens before narrowing to float.
+    glm::dvec3 view_matrix_origin_offset{};
+
     int last_update_camera_data_frame_count = 0;
     void update_camera_data(int frame_count);
 

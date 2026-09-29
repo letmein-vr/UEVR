@@ -33,6 +33,8 @@
 #include "render/D3D12Diagnostics.hpp"
 #include "DumperMode.hpp"
 #include "Framework.hpp"
+#include "FrameProfiler.hpp"
+#include <algorithm>
 #include "render/RenderDocCaptureService.hpp"
 #include "render/RenderDocCaptureControl.hpp"
 
@@ -216,14 +218,14 @@ void Framework::hook_monitor() {
     // reflection dumps.
     //
     // Normal UEVR bootstraps plugins in two phases:
-    //   1. Framework ctor calls PluginLoader::early_init ¡ú LoadLibrary each DLL
+    //   1. Framework ctor calls PluginLoader::early_init ï¿½ï¿½ LoadLibrary each DLL
     //   2. On first D3D Present, Framework::on_frame_d3d11/12 calls
-    //      Mods::on_initialize_d3d_thread ¡ú PluginLoader queries device/
+    //      Mods::on_initialize_d3d_thread ï¿½ï¿½ PluginLoader queries device/
     //      swapchain, calls uevr_plugin_required_version + uevr_plugin_initialize
     //   3. Stereo hook's on_frame installs UGameEngine::Tick hook
     //   4. Engine tick hook fans out on_pre_engine_tick to all mods + plugins
     //
-    // In dumper mode there's no Present ¡ú phases 2-4 never fire without
+    // In dumper mode there's no Present ï¿½ï¿½ phases 2-4 never fire without
     // intervention. We drive them from here instead: first mods::on_initialize
     // + on_initialize_d3d_thread (which now skips the D3D device queries),
     // then the stereo-hook's on_frame to install the tick hook.
@@ -233,7 +235,7 @@ void Framework::hook_monitor() {
 
         // One-shot phase-2: mods + plugin init. Equivalent of what the first
         // D3D Present would trigger. Must also set m_game_data_initialized
-        // so the engine_tick_hook fans out on_pre_engine_tick to mods ¡ª
+        // so the engine_tick_hook fans out on_pre_engine_tick to mods ï¿½ï¿½
         // otherwise the hook runs but returns before dispatching.
         if (!m_dumper_mods_initialized) {
             try {
@@ -241,7 +243,7 @@ void Framework::hook_monitor() {
                 (void)m_mods->on_initialize();
                 (void)m_mods->on_initialize_d3d_thread();
                 // m_game_data_initialized is the gate on engine_tick_hook
-                // fanning out to mods. Don't set m_initialized ¡ª that gates
+                // fanning out to mods. Don't set m_initialized ï¿½ï¿½ that gates
                 // imgui rendering which requires D3D in dumper mode.
                 m_game_data_initialized = true;
                 m_mods_fully_initialized = true;
@@ -1774,7 +1776,52 @@ void Framework::draw_ui() {
     }
 }
 
+void Framework::draw_frame_profiler() {
+    auto& profiler = uevr::perf::FrameProfiler::get();
+    auto entries = profiler.snapshot();
+
+    std::sort(entries.begin(), entries.end(), [](const auto& a, const auto& b) {
+        return a.ema_us > b.ema_us;
+    });
+
+    ImGui::Text("Mod work on the game thread per engine tick (avg / 1s peak)");
+    ImGui::Text("Total: %.3f ms avg, %.3f ms peak over %llu ticks",
+        profiler.total_ema_us() / 1000.0,
+        profiler.total_max_us() / 1000.0,
+        (unsigned long long)profiler.frames());
+    ImGui::Separator();
+
+    if (ImGui::BeginTable("frame_profiler", 3, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingStretchProp)) {
+        ImGui::TableSetupColumn("Section");
+        ImGui::TableSetupColumn("Avg ms");
+        ImGui::TableSetupColumn("Peak ms");
+        ImGui::TableHeadersRow();
+
+        for (const auto& entry : entries) {
+            if (entry.ema_us < 1.0 && entry.max_us < 1.0) {
+                continue; // nothing measurable, keep the table readable
+            }
+
+            ImGui::TableNextRow();
+            ImGui::TableSetColumnIndex(0);
+            ImGui::TextUnformatted(entry.name.c_str());
+            ImGui::TableSetColumnIndex(1);
+            ImGui::Text("%.3f", entry.ema_us / 1000.0);
+            ImGui::TableSetColumnIndex(2);
+            ImGui::Text("%.3f", entry.max_us / 1000.0);
+        }
+
+        ImGui::EndTable();
+    }
+}
+
 void Framework::draw_about() {
+    if (ImGui::CollapsingHeader("Frame Profiler", ImGuiTreeNodeFlags_DefaultOpen)) {
+        ImGui::TreePush("Frame Profiler");
+        draw_frame_profiler();
+        ImGui::TreePop();
+    }
+
     ImGui::Text("Author: joeyhodge");
     ImGui::Text("Unreal Engine VR");
     ImGui::Text("https://github.com/joeyhodge/UEVR/altdpad");

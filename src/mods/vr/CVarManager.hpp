@@ -187,6 +187,10 @@ public:
         sdk::IConsoleVariable* m_interface_cvar{nullptr};
         bool m_interface_fallback_attempted{false};
         bool m_setter_unavailable{false};
+        // Enforcement throttle for cvars the game rewrites every frame (or whose Set never sticks).
+        uint32_t m_consecutive_enforce_ticks{0};
+        std::chrono::steady_clock::time_point m_next_enforce_time{};
+        bool m_logged_enforce_throttle{false};
     };
 
     class CVarData : public CVar {

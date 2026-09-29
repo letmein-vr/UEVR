@@ -13,6 +13,7 @@
 #include "bindings/ImGui.hpp"
 #include "bindings/FS.hpp"
 #include "bindings/Json.hpp"
+#include "FrameProfiler.hpp"
 
 std::shared_ptr<LuaLoader>& LuaLoader::get() {
     static auto instance = std::make_shared<LuaLoader>();
@@ -59,6 +60,7 @@ void LuaLoader::on_frame() {
         return;
     }
 
+    UEVR_PERF_SCOPE("Lua.on_frame+gc");
     std::scoped_lock _{m_access_mutex};
 
     if (m_needs_first_reset) {

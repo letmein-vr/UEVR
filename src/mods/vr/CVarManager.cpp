@@ -22,6 +22,7 @@
 #include "Framework.hpp"
 
 #include "CVarManager.hpp"
+#include "FrameProfiler.hpp"
 #include "utility/ImGui.hpp"
 #include "utility/Logging.hpp"
 
@@ -725,31 +726,57 @@ void CVarManager::spawn_console() {
 void CVarManager::on_pre_engine_tick(sdk::UGameEngine* engine, float delta) {
     ZoneScopedN(__FUNCTION__);
 
-    process_diagnostics();
+    {
+        UEVR_PERF_SCOPE("CVarManager.diagnostics");
+        process_diagnostics();
+    }
 
     const bool process_all_cvars = m_needs_full_refresh || m_cvar_ui_open_this_frame;
 
-    if (process_all_cvars) {
-        for (auto& cvar : m_all_cvars) {
-            cvar->update();
+    // Per-cvar profiler slots so a single slow Get/Set can be identified from the About tab.
+    static std::unordered_map<const void*, size_t> update_slots{};
+    static std::unordered_map<const void*, size_t> freeze_slots{};
+    const auto slot_for = [](std::unordered_map<const void*, size_t>& slots, const char* prefix, const std::shared_ptr<CVar>& cvar) {
+        if (auto it = slots.find(cvar.get()); it != slots.end()) {
+            return it->second;
         }
-    } else if (m_has_frozen_cvars) {
-        for (auto& cvar : m_all_cvars) {
-            if (cvar->is_frozen()) {
+
+        const auto slot = uevr::perf::FrameProfiler::get().slot(std::string{prefix} + utility::narrow(cvar->get_name()));
+        slots[cvar.get()] = slot;
+        return slot;
+    };
+
+    {
+        UEVR_PERF_SCOPE("CVarManager.update");
+
+        if (process_all_cvars) {
+            for (auto& cvar : m_all_cvars) {
                 cvar->update();
+            }
+        } else if (m_has_frozen_cvars) {
+            for (auto& cvar : m_all_cvars) {
+                if (cvar->is_frozen()) {
+                    uevr::perf::FrameProfiler::Scope _perf{slot_for(update_slots, "cvar_update:", cvar)};
+                    cvar->update();
+                }
             }
         }
     }
 
     if (m_has_frozen_cvars) {
+        UEVR_PERF_SCOPE("CVarManager.freeze");
+
         for (auto& cvar : m_all_cvars) {
             if (process_all_cvars || cvar->is_frozen()) {
+                uevr::perf::FrameProfiler::Scope _perf{slot_for(freeze_slots, "cvar_freeze:", cvar)};
                 cvar->freeze();
             }
         }
     }
 
     m_needs_full_refresh = false;
+
+    UEVR_PERF_SCOPE("CVarManager.console_script+runtime_cvars");
 
     if (m_should_execute_console_script) {
         execute_console_script(engine, user_script_txt_name.data());
@@ -1358,7 +1385,42 @@ void CVarManager::CVarStandard::freeze() {
         SPDLOG_INFO("[CVarManager] (Standard) First time freezing \"{}\"...", utility::narrow(m_name));
     }
 
+    // A Set on a live IConsoleVariable is expensive (string parse, OnChanged callbacks, sinks, render
+    // thread enqueue): measured at 1-2.5 ms per call on The Outer Worlds 2. When the game rewrites the
+    // value every frame, or a Set silently never sticks, enforcing on every tick burns that cost for
+    // nothing. After a run of consecutive enforcements, back off to a fixed cadence instead.
+    constexpr uint32_t ENFORCE_THROTTLE_AFTER_TICKS = 30;
+    constexpr auto ENFORCE_THROTTLE_INTERVAL = std::chrono::milliseconds(250);
+
+    const auto now = std::chrono::steady_clock::now();
+
     const auto set_frozen_value = [&](const std::wstring& value) {
+        if (m_consecutive_enforce_ticks >= ENFORCE_THROTTLE_AFTER_TICKS) {
+            if (now < m_next_enforce_time) {
+                return;
+            }
+
+            m_next_enforce_time = now + ENFORCE_THROTTLE_INTERVAL;
+
+            if (!m_logged_enforce_throttle) {
+                m_logged_enforce_throttle = true;
+                SPDLOG_WARN(
+                    "[CVarManager] (Standard) \"{}\" needed enforcing on {} consecutive ticks (game keeps overriding it or Set does not stick); throttling enforcement to every {} ms",
+                    utility::narrow(m_name),
+                    m_consecutive_enforce_ticks,
+                    ENFORCE_THROTTLE_INTERVAL.count());
+            }
+        }
+
+        ++m_consecutive_enforce_ticks;
+
+        static std::unordered_map<const void*, size_t> set_slots{};
+        auto slot_it = set_slots.find(this);
+        if (slot_it == set_slots.end()) {
+            slot_it = set_slots.emplace(this, uevr::perf::FrameProfiler::get().slot("cvar_set:" + utility::narrow(m_name))).first;
+        }
+        uevr::perf::FrameProfiler::Scope _perf{slot_it->second};
+
         const auto start = std::chrono::steady_clock::now();
         const auto ok = cvar->Set(value.c_str());
         const auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count();
@@ -1375,22 +1437,34 @@ void CVarManager::CVarStandard::freeze() {
         }
     };
 
+    bool needs_enforce = false;
+
     switch(m_type) {
     case Type::BOOL:
-        // Limiting the amount of times Set gets called with string conversions.
-        if (cvar->GetInt() != m_frozen_int_value) {
-            set_frozen_value(std::to_wstring(m_frozen_int_value));
-        }
-        break;
     case Type::INT:
-        if (cvar->GetInt() != m_frozen_int_value) {
-            set_frozen_value(std::to_wstring(m_frozen_int_value));
-        }
+        // Limiting the amount of times Set gets called with string conversions.
+        needs_enforce = cvar->GetInt() != m_frozen_int_value;
         break;
     case Type::FLOAT:
-        if (cvar->GetFloat() != m_frozen_float_value) {
-            set_frozen_value(std::to_wstring(m_frozen_float_value));
-        }
+        needs_enforce = cvar->GetFloat() != m_frozen_float_value;
+        break;
+    default:
+        break;
+    };
+
+    if (!needs_enforce) {
+        // The value is holding; a later drift starts a fresh run before any throttling applies.
+        m_consecutive_enforce_ticks = 0;
+        return;
+    }
+
+    switch(m_type) {
+    case Type::BOOL:
+    case Type::INT:
+        set_frozen_value(std::to_wstring(m_frozen_int_value));
+        break;
+    case Type::FLOAT:
+        set_frozen_value(std::to_wstring(m_frozen_float_value));
         break;
     default:
         break;

@@ -2,6 +2,7 @@
 
 #include <ScriptUtility.hpp>
 #include <datatypes/StructObject.hpp>
+#include <FrameProfiler.hpp>
 
 namespace lua::datatypes {
     template<typename T>
@@ -15,6 +16,7 @@ namespace lua::datatypes {
     }
 
     void StructObject::construct(uevr::API::UStruct* def) {
+        UEVR_PERF_SCOPE("lua StructObject constructs (e.g. uevrUtils.vector())");
         // TODO: Call constructor? Not important for now
         if (def->is_a(uevr::API::UScriptStruct::static_class())) {
             auto script_struct = static_cast<uevr::API::UScriptStruct*>(def);
@@ -76,6 +78,8 @@ namespace lua::datatypes {
             "read_float", &read_t_structobject<float>,
             "read_double", &read_t_structobject<double>,
             sol::meta_function::index, [](sol::this_state s, StructObject* self, sol::object index_obj) -> sol::object {
+                UEVR_PERF_SCOPE("lua property reads (struct fields)");
+
                 if (!index_obj.is<std::string>()) {
                     return sol::make_object(s, sol::lua_nil);
                 }
@@ -85,6 +89,8 @@ namespace lua::datatypes {
                 return lua::utility::prop_to_object(s, self->object, self->desc, name);
             },
             sol::meta_function::new_index, [](sol::this_state s, StructObject* self, sol::object index_obj, sol::object value) {
+                UEVR_PERF_SCOPE("lua property writes (struct fields)");
+
                 if (!index_obj.is<std::string>()) {
                     return;
                 }

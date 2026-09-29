@@ -10,6 +10,7 @@
 #include <utility/ScopeGuard.hpp>
 
 #include "DumperMode.hpp"
+#include "FrameProfiler.hpp"
 
 #include <sdk/UObjectBase.hpp>
 #include <sdk/UObjectArray.hpp>
@@ -1622,6 +1623,18 @@ std::shared_ptr<UObjectHook::MotionControllerState> UObjectHook::get_or_add_moti
                 try_track_object(outer, "motion-controller API component outer", true, false);
             }
         }
+    } else if (m_fully_hooked && !exists(component)) {
+        // Same adoption for every other game. update_motion_controller_components() skips any
+        // attached component that is not tracked yet, and on titles without a usable AddObject
+        // hook (The Outer Worlds 2) new objects are only found by the background FUObjectArray
+        // sweep - a weapon mesh the game creates on equip was attached but left in place for
+        // ~10-20 s until that sweep reached it. try_track_object validates the candidate
+        // (FUObjectArray member) before add_new_object, exactly as on the Stalker2 path.
+        if (try_track_object(component, "motion-controller API component", true, false)) {
+            if (const auto outer = component->get_outer(); outer != nullptr) {
+                try_track_object(outer, "motion-controller API component outer", true, false);
+            }
+        }
     }
 
     std::unique_lock _{m_mutex};
@@ -1653,8 +1666,65 @@ std::shared_ptr<UObjectHook::MotionControllerState> UObjectHook::get_or_add_moti
 }
 
 void UObjectHook::mark_persistent_tracking_miss() {
-    m_last_persistent_tracking_miss = std::chrono::steady_clock::now();
+    const auto now = std::chrono::steady_clock::now();
     ++m_uobject_array_scan_stats.persistent_tracking_misses;
+
+    if (!m_persistent_miss_active) {
+        // A fresh miss (level change, weapon swap, new attachment): raise the scan priority right away.
+        m_persistent_miss_active = true;
+        m_persistent_miss_episode_start = now;
+        m_last_persistent_tracking_miss = now;
+        return;
+    }
+
+    // A miss that persists tick after tick (e.g. a saved path whose component name no longer exists,
+    // or a weapon that is not equipped) must not keep the full-speed FUObjectArray sweep armed forever.
+    // Path resolution already adopts every object it walks through directly, so the sweep only needs
+    // to be re-armed occasionally to catch anything the resolver cannot reach.
+    if (now - m_persistent_miss_episode_start >= PERSISTENT_MISS_REARM_INTERVAL) {
+        m_persistent_miss_episode_start = now;
+        m_last_persistent_tracking_miss = now;
+        ++m_uobject_array_scan_stats.persistent_miss_rearms;
+    }
+}
+
+std::string UObjectHook::get_expanded_object_name(sdk::UObject* object) {
+    // Persistent path resolution compares every child component against "ClassName ObjectName"
+    // on every tick. FName::to_string goes through the game's name pool and allocates, so cache
+    // the expanded string per object and validate it with the cheap FName/class identity.
+    const auto& fname = object->get_fname();
+    const auto klass = object->get_class();
+    const auto name_index = fname.a1;
+    const auto name_number = fname.get_number();
+
+    {
+        std::scoped_lock _{m_expanded_name_cache_mutex};
+
+        if (auto it = m_expanded_name_cache.find(object); it != m_expanded_name_cache.end()) {
+            const auto& entry = it->second;
+
+            if (entry.name_index == name_index && entry.name_number == name_number && entry.klass == klass) {
+                return entry.expanded;
+            }
+        }
+    }
+
+    std::string expanded{};
+
+    if (klass != nullptr) {
+        expanded = utility::narrow(klass->get_fname().to_string() + L" " + fname.to_string_remove_numbers());
+    } else {
+        expanded = utility::narrow(fname.to_string_remove_numbers());
+    }
+
+    std::scoped_lock _{m_expanded_name_cache_mutex};
+
+    if (m_expanded_name_cache.size() >= EXPANDED_NAME_CACHE_LIMIT) {
+        m_expanded_name_cache.clear();
+    }
+
+    m_expanded_name_cache[object] = ExpandedNameCacheEntry{name_index, name_number, klass, expanded};
+    return expanded;
 }
 
 void UObjectHook::prune_destroyed_object_tombstones(std::chrono::steady_clock::time_point now) {
@@ -1911,11 +1981,13 @@ uint32_t UObjectHook::get_uobject_array_scan_budget(sdk::UGameEngine* engine) {
         m_force_uobject_array_creation_scan.store(false, std::memory_order_relaxed);
 
         uint32_t budget = 0;
+        m_uobject_array_scan_high_priority = false;
 
         if (m_stalker2_uobject_full_scan_requested.load(std::memory_order_relaxed)) {
             if (m_uobject_array_scan_cursor < object_count) {
                 budget = STALKER2_FULL_SCAN_BUDGET;
                 m_uobject_array_full_sweep_active = true;
+                m_uobject_array_scan_high_priority = true;
             } else {
                 m_stalker2_uobject_full_scan_requested.store(false, std::memory_order_relaxed);
                 m_uobject_array_full_sweep_active = false;
@@ -1940,6 +2012,7 @@ uint32_t UObjectHook::get_uobject_array_scan_budget(sdk::UGameEngine* engine) {
         pawn_tracking_unhealthy;
 
     uint32_t budget = 0;
+    m_uobject_array_scan_high_priority = false;
 
     if (high_priority) {
         if (m_uobject_array_scan_cursor >= object_count) {
@@ -1951,6 +2024,7 @@ uint32_t UObjectHook::get_uobject_array_scan_budget(sdk::UGameEngine* engine) {
         // When AddObject is unreliable, scan fast enough to catch newly possessed pawns
         // without doing a permanent full-speed sweep every frame after gameplay starts.
         budget = add_object_guard_unreliable ? 4096 : 8192;
+        m_uobject_array_scan_high_priority = true;
     } else if (m_uobject_array_scan_cursor < object_count) {
         budget = 1024;
     } else if (!m_uobject_array_full_sweep_active && now - m_last_uobject_array_full_sweep >= std::chrono::seconds(5)) {
@@ -2059,7 +2133,11 @@ void UObjectHook::refresh_new_objects_from_uobject_array(uint32_t max_objects) {
 
     // Time-box the adoption work so a large post-load backlog is spread across ticks instead
     // of stretching one frame by seconds. The cursor only advances past what was processed.
-    constexpr auto scan_time_budget = std::chrono::milliseconds{4};
+    // The background sweep (nothing missing, just keeping the mirror fresh) gets a small slice of the
+    // frame; only startup, an untracked pawn, or a fresh persistent-path miss may spend the full budget.
+    const auto scan_time_budget = m_uobject_array_scan_high_priority ?
+        std::chrono::milliseconds{4} :
+        std::chrono::milliseconds{1};
     const auto scan_start = std::chrono::steady_clock::now();
     int32_t resume_cursor = end;
     size_t processed = 0;
@@ -2155,10 +2233,18 @@ void UObjectHook::on_pre_engine_tick(sdk::UGameEngine* engine, float delta) {
             }
         }
 
-        if (const auto scan_budget = get_uobject_array_scan_budget(engine); scan_budget > 0) {
-            refresh_new_objects_from_uobject_array(scan_budget);
+        {
+            UEVR_PERF_SCOPE("UObjectHook.array_scan");
+
+            if (const auto scan_budget = get_uobject_array_scan_budget(engine); scan_budget > 0) {
+                refresh_new_objects_from_uobject_array(scan_budget);
+            }
         }
-        update_persistent_states();
+
+        {
+            UEVR_PERF_SCOPE("UObjectHook.persistent_states");
+            update_persistent_states();
+        }
     }
 }
 
@@ -2248,6 +2334,7 @@ void UObjectHook::on_pre_calculate_stereo_view_offset(void* stereo_device, const
         } // else todo?
     }
     if (should_tick_motion_controller_attachments_for_view(view_index, is_double)) {
+        UEVR_PERF_SCOPE("UObjectHook.tick_attachments");
         tick_attachments(view_rotation, world_to_meters, view_location, is_double);
     }
 }
@@ -3464,6 +3551,8 @@ void UObjectHook::update_persistent_states() {
 
     if (had_tracking_miss) {
         mark_persistent_tracking_miss();
+    } else {
+        m_persistent_miss_active = false;
     }
 }
 
@@ -3722,11 +3811,8 @@ UObjectHook::ResolvedObject UObjectHook::StatePath::resolve(bool require_tracked
                     continue;
                 }
 
-                const auto& comp_fname = comp->get_fname();
-                const auto comp_name = comp_fname.to_string_remove_numbers();
-                const auto comp_ends_with_number = comp_fname.get_number() != 0;
-
-                const auto comp_expanded_name = utility::narrow(comp->get_class()->get_fname().to_string() + L" " + comp_name);
+                const auto comp_ends_with_number = comp->get_fname().get_number() != 0;
+                const auto comp_expanded_name = hook->get_expanded_object_name(comp);
                 const auto is_match = comp_ends_with_number ? next_it->starts_with(comp_expanded_name) 
                                                             : *next_it == comp_expanded_name;
 
@@ -3853,11 +3939,8 @@ UObjectHook::ResolvedObject UObjectHook::StatePath::resolve(bool require_tracked
                         continue;
                     }
 
-                    const auto& obj_fname = obj->get_fname();
-                    const auto obj_name = obj_fname.to_string_remove_numbers();
-                    const auto obj_ends_with_number = obj_fname.get_number() != 0;
-
-                    const auto obj_expanded_name = utility::narrow(obj->get_class()->get_fname().to_string() + L" " + obj_name);
+                    const auto obj_ends_with_number = obj->get_fname().get_number() != 0;
+                    const auto obj_expanded_name = hook->get_expanded_object_name(obj);
                     const auto is_match = obj_ends_with_number ? prop_it->starts_with(obj_expanded_name) 
                                                                : *prop_it == obj_expanded_name;
 
@@ -4360,9 +4443,17 @@ void UObjectHook::draw_main() {
             m_uobject_array_scan_stats.tombstone_skips,
             m_uobject_array_scan_stats.full_sweeps);
         ImGui::Text(
-            "Persistent misses: %llu tombstones=%zu",
+            "Persistent misses: %llu (active=%s rearms=%llu) tombstones=%zu",
             m_uobject_array_scan_stats.persistent_tracking_misses,
+            m_persistent_miss_active ? "yes" : "no",
+            m_uobject_array_scan_stats.persistent_miss_rearms,
             m_destroyed_object_tombstones.size());
+        ImGui::Text(
+            "Scan timing: last=%u ms priority=%s budget_cuts=%llu name_cache=%zu",
+            m_uobject_array_scan_stats.last_scan_ms,
+            m_uobject_array_scan_high_priority ? "high (4 ms)" : "background (1 ms)",
+            m_uobject_array_scan_stats.time_budget_cuts,
+            m_expanded_name_cache.size());
         ImGui::Text(
             "UI nested resolver: attempts=%llu adopted=%llu refused=%llu cached_refusals=%llu",
             m_ui_nested_resolve_stats.attempts,

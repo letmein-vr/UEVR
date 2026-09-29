@@ -71,6 +71,7 @@
 #include <sdk/FTextureRenderTargetResource.hpp>
 
 #include "Framework.hpp"
+#include "FrameProfiler.hpp"
 #include "Mods.hpp"
 #include "DumperMode.hpp"
 #include "mods/UObjectHook.hpp"
@@ -12404,7 +12405,10 @@ void* FFakeStereoRenderingHook::engine_tick_hook(sdk::UGameEngine* engine, float
     }
 
     // Best place to run game thread jobs.
-    GameThreadWorker::get().execute();
+    {
+        UEVR_PERF_SCOPE("Framework.GameThreadWorker");
+        GameThreadWorker::get().execute();
+    }
 
     if (hook->m_ignore_next_engine_tick) {
         hook->m_ignored_engine_delta = delta;
@@ -12418,6 +12422,7 @@ void* FFakeStereoRenderingHook::engine_tick_hook(sdk::UGameEngine* engine, float
     // still runs, so plugins still get on_pre_engine_tick callbacks.
     if (!uevr::is_dumper_mode()) {
         g_framework->enable_engine_thread();
+        UEVR_PERF_SCOPE("Framework.imgui_frame+on_frame");
         g_framework->run_imgui_frame(false);
     }
 
@@ -12429,13 +12434,25 @@ void* FFakeStereoRenderingHook::engine_tick_hook(sdk::UGameEngine* engine, float
     }
 
     const auto& mods = g_framework->get_mods()->get_mods();
-    for (auto& mod : mods) {
-        mod->on_pre_engine_tick(engine, delta);
+    static std::vector<size_t> pre_tick_perf_slots{};
+    if (pre_tick_perf_slots.size() != mods.size()) {
+        pre_tick_perf_slots.clear();
+        for (auto& mod : mods) {
+            pre_tick_perf_slots.push_back(uevr::perf::FrameProfiler::get().slot("pre_tick:" + std::string{mod->get_name()}));
+        }
+    }
+    for (size_t i = 0; i < mods.size(); ++i) {
+        uevr::perf::FrameProfiler::Scope _perf{pre_tick_perf_slots[i]};
+        mods[i]->on_pre_engine_tick(engine, delta);
     }
 
     void* result = nullptr;
 
     {
+        // The game's own UGameEngine::Tick. Not mod work; shown so the mod's share of the
+        // game thread can be compared against the game's, and against the wall-clock interval.
+        UEVR_PERF_SCOPE("Game.UGameEngine::Tick (game code, not mod work)");
+
         if (hook->m_safe_tick_hook->value()) {
             result = hook->m_tick_hook.call<void*>(engine, delta, idle);
         } else {
@@ -12471,13 +12488,23 @@ void* FFakeStereoRenderingHook::engine_tick_hook(sdk::UGameEngine* engine, float
         }
     }
 
-    for (auto& mod : mods) {
-        mod->on_post_engine_tick(engine, delta);
+    static std::vector<size_t> post_tick_perf_slots{};
+    if (post_tick_perf_slots.size() != mods.size()) {
+        post_tick_perf_slots.clear();
+        for (auto& mod : mods) {
+            post_tick_perf_slots.push_back(uevr::perf::FrameProfiler::get().slot("post_tick:" + std::string{mod->get_name()}));
+        }
+    }
+    for (size_t i = 0; i < mods.size(); ++i) {
+        uevr::perf::FrameProfiler::Scope _perf{post_tick_perf_slots[i]};
+        mods[i]->on_post_engine_tick(engine, delta);
     }
 
     if (hook->m_tracking_system_hook != nullptr) {
         hook->m_tracking_system_hook->on_post_engine_tick(engine, delta);
     }
+
+    uevr::perf::FrameProfiler::get().end_frame();
 
     return result;
 }
@@ -26462,12 +26489,22 @@ __forceinline void FFakeStereoRenderingHook::calculate_stereo_view_offset(
     const auto& mods = g_framework->get_mods()->get_mods();
 
     if (!is_full_pass) {
-        for (auto& mod : mods) {
-            mod->on_early_calculate_stereo_view_offset(stereo, view_index, view_rotation, world_to_meters, view_location, g_hook->m_has_double_precision);
+        static std::vector<size_t> stereo_pre_perf_slots{};
+        if (stereo_pre_perf_slots.size() != mods.size()) {
+            stereo_pre_perf_slots.clear();
+            for (auto& mod : mods) {
+                stereo_pre_perf_slots.push_back(uevr::perf::FrameProfiler::get().slot("stereo_pre:" + std::string{mod->get_name()}));
+            }
         }
 
-        for (auto& mod : mods) {
-            mod->on_pre_calculate_stereo_view_offset(stereo, view_index, view_rotation, world_to_meters, view_location, g_hook->m_has_double_precision);
+        for (size_t i = 0; i < mods.size(); ++i) {
+            uevr::perf::FrameProfiler::Scope _perf{stereo_pre_perf_slots[i]};
+            mods[i]->on_early_calculate_stereo_view_offset(stereo, view_index, view_rotation, world_to_meters, view_location, g_hook->m_has_double_precision);
+        }
+
+        for (size_t i = 0; i < mods.size(); ++i) {
+            uevr::perf::FrameProfiler::Scope _perf{stereo_pre_perf_slots[i]};
+            mods[i]->on_pre_calculate_stereo_view_offset(stereo, view_index, view_rotation, world_to_meters, view_location, g_hook->m_has_double_precision);
         }
     }
 
@@ -26654,8 +26691,17 @@ __forceinline void FFakeStereoRenderingHook::calculate_stereo_view_offset(
     }
 
     if (!is_full_pass) {
-        for (auto& mod : mods) {
-            mod->on_post_calculate_stereo_view_offset(stereo, view_index, view_rotation, world_to_meters, view_location, g_hook->m_has_double_precision);
+        static std::vector<size_t> stereo_post_perf_slots{};
+        if (stereo_post_perf_slots.size() != mods.size()) {
+            stereo_post_perf_slots.clear();
+            for (auto& mod : mods) {
+                stereo_post_perf_slots.push_back(uevr::perf::FrameProfiler::get().slot("stereo_post:" + std::string{mod->get_name()}));
+            }
+        }
+
+        for (size_t i = 0; i < mods.size(); ++i) {
+            uevr::perf::FrameProfiler::Scope _perf{stereo_post_perf_slots[i]};
+            mods[i]->on_post_calculate_stereo_view_offset(stereo, view_index, view_rotation, world_to_meters, view_location, g_hook->m_has_double_precision);
         }
 
         if (true_index == 0 || vr->is_using_afw()) {
@@ -26731,19 +26777,27 @@ __forceinline void FFakeStereoRenderingHook::calculate_stereo_view_offset(
                 glm::radians(-(float)rot_d_other.yaw),
                 glm::radians((float)rot_d_other.pitch),
                 glm::radians(-(float)rot_d_other.roll));
-        glm::vec3 cam_pos;
-        glm::vec3 cam_pos_other;
+        glm::dvec3 cam_pos_d;
+        glm::dvec3 cam_pos_d_other;
         if (!has_double_precision) {
-            cam_pos = (*view_location) / vr->get_world_to_meters();
-            cam_pos_other = view_location_other / vr->get_world_to_meters();
-            cam_pos = glm::vec3(cam_pos.y, cam_pos.z, -cam_pos.x);
-            cam_pos_other = glm::vec3(cam_pos_other.y, cam_pos_other.z, -cam_pos_other.x);
+            cam_pos_d = glm::dvec3{*view_location} / double(vr->get_world_to_meters());
+            cam_pos_d_other = glm::dvec3{view_location_other} / double(vr->get_world_to_meters());
         } else {
-            glm::dvec3 cam_pos_d = (*view_d) / double(vr->get_world_to_meters());
-            glm::dvec3 cam_pos_d_other = view_d_other / double(vr->get_world_to_meters());
-            cam_pos = glm::vec3(cam_pos_d.y, cam_pos_d.z, -cam_pos_d.x);
-            cam_pos_other = glm::vec3(cam_pos_d_other.y, cam_pos_d_other.z, -cam_pos_d_other.x);
+            cam_pos_d = (*view_d) / double(vr->get_world_to_meters());
+            cam_pos_d_other = view_d_other / double(vr->get_world_to_meters());
         }
+        cam_pos_d = glm::dvec3(cam_pos_d.y, cam_pos_d.z, -cam_pos_d.x);
+        cam_pos_d_other = glm::dvec3(cam_pos_d_other.y, cam_pos_d_other.z, -cam_pos_d_other.x);
+
+        // Large-coordinate fix (PureDark beta.5, 3fccbb6): express the AFW view matrices
+        // relative to a re-based origin so float precision holds far from the world
+        // origin. Done in double before narrowing so nothing is lost on the way.
+        if (glm::distance(vr->view_matrix_origin_offset, cam_pos_d) > 100.0) {
+            vr->view_matrix_origin_offset = cam_pos_d;
+        }
+
+        const glm::vec3 cam_pos = glm::vec3{cam_pos_d - vr->view_matrix_origin_offset};
+        const glm::vec3 cam_pos_other = glm::vec3{cam_pos_d_other - vr->view_matrix_origin_offset};
 
         glm::mat4 view_inv_matrix = glm::translate(glm::mat4(1.0f), cam_pos) * view_to_world;
         glm::mat4 view_inv_matrix_other = glm::translate(glm::mat4(1.0f), cam_pos_other) * view_to_world_other;

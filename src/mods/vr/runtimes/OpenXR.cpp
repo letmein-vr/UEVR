@@ -2,6 +2,8 @@
 #include <TlHelp32.h>
 #include <cmath>
 #include <chrono>
+
+#include "FrameProfiler.hpp"
 #include <filesystem>
 #include <fstream>
 #include <sstream>
@@ -960,7 +962,7 @@ bool OpenXR::recover_focused_stale_frame_loop(const char* caller) {
         const auto begin_frame_start = collect_frame_timing
             ? std::chrono::steady_clock::now()
             : std::chrono::steady_clock::time_point{};
-        const auto begin_result = xrBeginFrame(this->session, &frame_begin_info);
+        const auto begin_result = [&]() { UEVR_PERF_SCOPE("OpenXR.xrBeginFrame"); return xrBeginFrame(this->session, &frame_begin_info); }();
         if (collect_frame_timing) {
             this->begin_frame_timing.add(std::chrono::steady_clock::now() - begin_frame_start);
         }
@@ -986,7 +988,7 @@ bool OpenXR::recover_focused_stale_frame_loop(const char* caller) {
         const auto end_frame_start = collect_frame_timing
             ? std::chrono::steady_clock::now()
             : std::chrono::steady_clock::time_point{};
-        const auto end_result = xrEndFrame(this->session, &frame_end_info);
+        const auto end_result = [&]() { UEVR_PERF_SCOPE("OpenXR.xrEndFrame"); return xrEndFrame(this->session, &frame_end_info); }();
         if (collect_frame_timing) {
             this->end_frame_timing.add(std::chrono::steady_clock::now() - end_frame_start);
         }
@@ -1028,7 +1030,7 @@ XrResult OpenXR::recover_wedged_frame(const char* reason) {
     frame_end_info.layerCount = 0;
     frame_end_info.layers = nullptr;
 
-    const auto result = xrEndFrame(this->session, &frame_end_info);
+    const auto result = [&]() { UEVR_PERF_SCOPE("OpenXR.xrEndFrame"); return xrEndFrame(this->session, &frame_end_info); }();
 
     if (result != XR_SUCCESS) {
         spdlog::error("[OpenXR] Recovery xrEndFrame failed ({}): {}", reason, this->get_result_string(result));
@@ -1063,7 +1065,7 @@ bool OpenXR::close_synced_frame_without_layers(const char* reason) {
         const auto begin_frame_start = collect_frame_timing
             ? std::chrono::steady_clock::now()
             : std::chrono::steady_clock::time_point{};
-        const auto begin_result = xrBeginFrame(this->session, &frame_begin_info);
+        const auto begin_result = [&]() { UEVR_PERF_SCOPE("OpenXR.xrBeginFrame"); return xrBeginFrame(this->session, &frame_begin_info); }();
         if (collect_frame_timing) {
             this->begin_frame_timing.add(std::chrono::steady_clock::now() - begin_frame_start);
         }
@@ -1091,7 +1093,7 @@ bool OpenXR::close_synced_frame_without_layers(const char* reason) {
     const auto end_frame_start = collect_frame_timing
         ? std::chrono::steady_clock::now()
         : std::chrono::steady_clock::time_point{};
-    const auto result = xrEndFrame(this->session, &frame_end_info);
+    const auto result = [&]() { UEVR_PERF_SCOPE("OpenXR.xrEndFrame"); return xrEndFrame(this->session, &frame_end_info); }();
     if (collect_frame_timing) {
         this->end_frame_timing.add(std::chrono::steady_clock::now() - end_frame_start);
     }
@@ -1235,6 +1237,10 @@ VRRuntime::Error OpenXR::synchronize_frame(std::optional<uint32_t> frame_count, 
     auto result = xrWaitFrame(this->session, &frame_wait_info, &local_frame_state);
     const auto wait_frame_end = std::chrono::steady_clock::now();
     const auto wait_frame_duration = wait_frame_end - wait_frame_start;
+    {
+        static const size_t perf_slot = uevr::perf::FrameProfiler::get().slot("OpenXR.xrWaitFrame (blocked)");
+        uevr::perf::FrameProfiler::get().add(perf_slot, std::chrono::duration<double, std::micro>{wait_frame_duration}.count());
+    }
     if (collect_openxr_frame_timing()) {
         this->wait_frame_timing.add(wait_frame_duration);
 
@@ -3488,7 +3494,7 @@ XrResult OpenXR::begin_frame(const char* caller) {
             frame_end_info.layerCount = 0;
             frame_end_info.layers = nullptr;
 
-            const auto end_result = xrEndFrame(this->session, &frame_end_info);
+            const auto end_result = [&]() { UEVR_PERF_SCOPE("OpenXR.xrEndFrame"); return xrEndFrame(this->session, &frame_end_info); }();
             this->frame_began = false;
             this->clear_frame_synced("startup_empty_frame");
             ++this->forced_frame_recovery_count;

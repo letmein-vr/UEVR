@@ -42,6 +42,7 @@
 #include "utility/SupportDiagnostics.hpp"
 
 #include "Framework.hpp"
+#include "FrameProfiler.hpp"
 #include "frameworkConfig.hpp"
 
 #include "utility/Logging.hpp"
@@ -5221,7 +5222,10 @@ void VR::on_pre_engine_tick(sdk::UGameEngine* engine, float delta) {
     const auto previous_engine_tick = m_last_engine_tick;
     const bool hitch_diagnostics_enabled = m_enable_hitch_diagnostics->value();
 
-    m_cvar_manager->on_pre_engine_tick(engine, delta);
+    {
+        UEVR_PERF_SCOPE("VR.cvar_manager");
+        m_cvar_manager->on_pre_engine_tick(engine, delta);
+    }
     if (!hitch_diagnostics_enabled) {
         if (m_hitch_diagnostics_enabled_last_frame) {
             stop_hitch_snapshot_writer();
@@ -5344,27 +5348,51 @@ void VR::on_pre_engine_tick(sdk::UGameEngine* engine, float delta) {
 
     SPDLOG_INFO_ONCE("VR: Pre-engine tick");
 
-    m_render_target_pool_hook->on_pre_engine_tick(engine, delta);
-    update_subnautica2_save_thumbnail_guard(engine);
-    update_subnautica2_native_water_compatibility(engine);
-    update_1666amsterdam_native_postprocess_compatibility(engine);
-    update_daysgone_gbuffer_compatibility(engine);
-    update_everspace2_cinematic_bars(engine);
+    {
+        UEVR_PERF_SCOPE("VR.render_target_pool_hook");
+        m_render_target_pool_hook->on_pre_engine_tick(engine, delta);
+    }
 
-    update_statistics_overlay(engine);
-    update_game_fov();
-    update_shf_auto_2d_mode(engine);
-    update_dispatch_auto_2d_mode(engine);
-    update_mixtape_auto_2d_mode(engine);
-    update_the_sinking_city_2_bink_ui_state(engine);
-    update_halo_electra_cinematic_state(engine);
-    update_windrose_meta_ui_auto_2d_mode();
+    {
+        UEVR_PERF_SCOPE("VR.game_specific_compat");
+        update_subnautica2_save_thumbnail_guard(engine);
+        update_subnautica2_native_water_compatibility(engine);
+        update_1666amsterdam_native_postprocess_compatibility(engine);
+        update_daysgone_gbuffer_compatibility(engine);
+        update_everspace2_cinematic_bars(engine);
+    }
+
+    {
+        UEVR_PERF_SCOPE("VR.statistics_overlay");
+        update_statistics_overlay(engine);
+    }
+
+    {
+        UEVR_PERF_SCOPE("VR.game_fov");
+        update_game_fov();
+    }
+
+    {
+        UEVR_PERF_SCOPE("VR.auto_2d_and_cinematic");
+        update_shf_auto_2d_mode(engine);
+        update_dispatch_auto_2d_mode(engine);
+        update_mixtape_auto_2d_mode(engine);
+        update_the_sinking_city_2_bink_ui_state(engine);
+        update_halo_electra_cinematic_state(engine);
+        update_windrose_meta_ui_auto_2d_mode();
+    }
 
     // Dont update action states on AFR frames
     // TODO: fix this for actual AFR, but we dont really care about pure AFR since synced beats it most of the time
     if (m_fake_stereo_hook != nullptr && !m_fake_stereo_hook->is_ignoring_next_viewport_draw()) {
-        update_action_states();
-        update_imgui_state_from_vr_controller_fallback();
+        {
+            UEVR_PERF_SCOPE("VR.update_action_states");
+            update_action_states();
+        }
+        {
+            UEVR_PERF_SCOPE("VR.imgui_controller_fallback");
+            update_imgui_state_from_vr_controller_fallback();
+        }
     }
 }
 

@@ -1,6 +1,10 @@
 // This can be considered a binding of the C API.
+#include <chrono>
 #include <iostream>
 #include <memory>
+#include <mutex>
+#include <string>
+#include <unordered_map>
 
 #include <utility/String.hpp>
 
@@ -17,6 +21,56 @@
 
 #include "ScriptUtility.hpp"
 #include "ScriptContext.hpp"
+#include "FrameProfiler.hpp"
+
+namespace {
+// One frame-profiler row per registered Lua callback, named after the event and the
+// script file:line that defined the function, so the About tab shows which script
+// owns the Lua time instead of one aggregate PluginLoader row.
+size_t lua_callback_perf_slot(lua_State* L, const sol::reference& fn, const char* event) {
+    static std::mutex mtx{};
+    static std::unordered_map<std::string, std::unordered_map<const void*, size_t>> slots{};
+
+    const auto key = fn.pointer();
+
+    {
+        std::scoped_lock _{mtx};
+        auto& event_slots = slots[event];
+
+        if (const auto it = event_slots.find(key); it != event_slots.end()) {
+            return it->second;
+        }
+    }
+
+    std::string name = std::string{"lua "} + event + " ";
+
+    try {
+        fn.push();
+        lua_Debug ar{};
+
+        if (lua_getinfo(L, ">S", &ar) != 0) {
+            std::string src = ar.short_src != nullptr ? ar.short_src : "?";
+            const auto slash = src.find_last_of("/\\");
+
+            if (slash != std::string::npos) {
+                src = src.substr(slash + 1);
+            }
+
+            name += src + ":" + std::to_string(ar.linedefined);
+        } else {
+            name += "?";
+        }
+    } catch (...) {
+        name += "?";
+    }
+
+    const auto slot = uevr::perf::FrameProfiler::get().slot(name);
+
+    std::scoped_lock _{mtx};
+    slots[event][key] = slot;
+    return slot;
+}
+} // namespace
 
 namespace uevr {
 class ScriptContexts {
@@ -685,9 +739,11 @@ int ScriptContext::setup_bindings() {
         "read_float", &lua::utility::read_t<float>,
         "read_double", &lua::utility::read_t<double>,
         sol::meta_function::index, [](sol::this_state s, uevr::API::UObject* self, const std::wstring& index_obj) -> sol::object {
+            UEVR_PERF_SCOPE("lua property reads (UObject fields/methods)");
             return lua::utility::prop_to_object(s, self, index_obj);
         },
         sol::meta_function::new_index, [](sol::this_state s, uevr::API::UObject* self, const std::wstring& index_obj, sol::object value) {
+            UEVR_PERF_SCOPE("lua property writes (UObject fields)");
             lua::utility::set_property(s, self, index_obj, value);
         }
     );
@@ -1155,6 +1211,65 @@ int ScriptContext::setup_bindings() {
     out["plugin_callbacks"] = m_plugin_initialize_param->callbacks;
     out["sdk"] = m_plugin_initialize_param->sdk;
 
+    // uevr.perf: lets scripts add rows to the backend's Frame Profiler (About tab).
+    //   local t = uevr.perf.now_us()
+    //   ... work ...
+    //   uevr.perf.add("my section", uevr.perf.now_us() - t)
+    // Slots are resolved by name and cached on the Lua side via a small table.
+    {
+        auto perf = m_lua.create_table();
+
+        perf["now_us"] = []() -> double {
+            return std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now().time_since_epoch()).count();
+        };
+
+        perf["add"] = [](const std::string& name, double us) {
+            static std::mutex mtx{};
+            static std::unordered_map<std::string, size_t> slots{};
+
+            size_t slot{};
+
+            {
+                std::scoped_lock _{mtx};
+
+                if (const auto it = slots.find(name); it != slots.end()) {
+                    slot = it->second;
+                } else {
+                    slot = uevr::perf::FrameProfiler::get().slot("lua " + name);
+                    slots[name] = slot;
+                }
+            }
+
+            uevr::perf::FrameProfiler::get().add(slot, us);
+        };
+
+        // "file.lua:line" for a Lua function, since the sandbox does not expose the debug library.
+        perf["describe"] = [](sol::this_state s, sol::object fn) -> std::string {
+            if (fn.get_type() != sol::type::function) {
+                return "";
+            }
+
+            lua_State* L = s;
+            fn.push(L);
+            lua_Debug ar{};
+
+            if (lua_getinfo(L, ">S", &ar) == 0) {
+                return "";
+            }
+
+            std::string src = ar.short_src != nullptr ? ar.short_src : "?";
+            const auto slash = src.find_last_of("/\\");
+
+            if (slash != std::string::npos) {
+                src = src.substr(slash + 1);
+            }
+
+            return src + ":" + std::to_string(ar.linedefined);
+        };
+
+        out["perf"] = perf;
+    }
+
     m_plugin_initialize_param->lua->add_additional_bindings(m_lua.lua_state());
 
     return out.push(m_lua.lua_state());
@@ -1221,6 +1336,7 @@ void ScriptContext::on_xinput_get_state(uint32_t* retval, uint32_t user_index, v
         std::scoped_lock _{ ctx->m_mtx };
 
         for (auto& fn : ctx->m_on_xinput_get_state_callbacks) try {
+            uevr::perf::FrameProfiler::Scope _perf{lua_callback_perf_slot(ctx->m_lua.lua_state(), fn, "xinput")};
             ctx->handle_protected_result(fn(retval, user_index, (XINPUT_STATE*)state));
         } catch (const std::exception& e) {
             ctx->log_error("Exception in on_xinput_get_state: " + std::string(e.what()));
@@ -1251,6 +1367,7 @@ void ScriptContext::on_pre_engine_tick(UEVR_UGameEngineHandle engine, float delt
         auto engine_obj = sol::make_object(ctx->m_lua.lua_state(), (uevr::API::UObject*)engine);
 
         for (auto& fn : ctx->m_on_pre_engine_tick_callbacks) try {
+            uevr::perf::FrameProfiler::Scope _perf{lua_callback_perf_slot(ctx->m_lua.lua_state(), fn, "pre_tick")};
             ctx->handle_protected_result(fn(engine_obj, delta_seconds));
         } catch (const std::exception& e) {
             ctx->log_error("Exception in on_pre_engine_tick: " + std::string(e.what()));
@@ -1267,6 +1384,7 @@ void ScriptContext::on_post_engine_tick(UEVR_UGameEngineHandle engine, float del
         auto engine_obj = sol::make_object(ctx->m_lua.lua_state(), (uevr::API::UObject*)engine);
 
         for (auto& fn : ctx->m_on_post_engine_tick_callbacks) try {
+            uevr::perf::FrameProfiler::Scope _perf{lua_callback_perf_slot(ctx->m_lua.lua_state(), fn, "post_tick")};
             ctx->handle_protected_result(fn(engine_obj, delta_seconds));
         } catch (const std::exception& e) {
             ctx->log_error("Exception in on_post_engine_tick: " + std::string(e.what()));
@@ -1321,6 +1439,7 @@ void ScriptContext::on_early_calculate_stereo_view_offset(UEVR_StereoRenderingDe
         const auto is_ue5 = lua::utility::is_ue5();
 
         for (auto& fn : ctx->m_on_early_calculate_stereo_view_offset_callbacks) try {
+            uevr::perf::FrameProfiler::Scope _perf{lua_callback_perf_slot(ctx->m_lua.lua_state(), fn, "stereo_early")};
             if (is_ue5) {
                 ctx->handle_protected_result(fn(device, view_index, world_to_meters, ue5_position, ue5_rotation, is_double));
             } else {
@@ -1351,6 +1470,7 @@ void ScriptContext::on_pre_calculate_stereo_view_offset(UEVR_StereoRenderingDevi
         const auto is_ue5 = lua::utility::is_ue5();
 
         for (auto& fn : ctx->m_on_pre_calculate_stereo_view_offset_callbacks) try {
+            uevr::perf::FrameProfiler::Scope _perf{lua_callback_perf_slot(ctx->m_lua.lua_state(), fn, "stereo_pre")};
             if (is_ue5) {
                 ctx->handle_protected_result(fn(device, view_index, world_to_meters, ue5_position, ue5_rotation, is_double));
             } else {
@@ -1381,6 +1501,7 @@ void ScriptContext::on_post_calculate_stereo_view_offset(UEVR_StereoRenderingDev
         const auto is_ue5 = lua::utility::is_ue5();
 
         for (auto& fn : ctx->m_on_post_calculate_stereo_view_offset_callbacks) try {
+            uevr::perf::FrameProfiler::Scope _perf{lua_callback_perf_slot(ctx->m_lua.lua_state(), fn, "stereo_post")};
             if (is_ue5) {
                 ctx->handle_protected_result(fn(device, view_index, world_to_meters, ue5_position, ue5_rotation, is_double));
             } else {
