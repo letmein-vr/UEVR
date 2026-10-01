@@ -2260,7 +2260,11 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
     // being presented. On a miss, re-submit the last same-frame pair (both eyes) for a few frames
     // rather than a black or mismatched right eye, then fall back to the frame-window path.
     constexpr uint32_t NATIVE_LAST_PAIR_MAX_REUSES = 3;
+    // Packet-less Presents (keyed miss past the limit above, frame-window refusal, D3D12 rejection)
+    // may re-submit the last same-frame pair this many times in a row before the raw target is used.
+    constexpr uint32_t NATIVE_LAST_PAIR_FALLBACK_MAX_REUSES = 8;
     const bool keyed_native_submit = ffsr != nullptr && ffsr->uses_frame_keyed_native_packets();
+    const bool native_pair_fallback = ffsr != nullptr && ffsr->uses_native_last_pair_fallback();
     bool use_native_last_pair = false;
     decltype(ffsr->get_native_stereo_frame_packet_for_submit(0)) native_stereo_packet{};
 
@@ -2296,6 +2300,14 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
     } else if (ffsr != nullptr) {
         native_stereo_packet = ffsr->get_native_stereo_frame_packet_for_submit(
             frame_count, frame_diag::Backend::d3d12, &native_frame_ticket);
+    }
+
+    if (native_pair_fallback) {
+        if (native_stereo_packet != nullptr) {
+            m_native_last_pair_reuses = 0;
+        }
+        SPDLOG_INFO_EVERY_N_SEC(10, "[NativeStereoFix][PairFallback] keyed={} packet-less Presents re-submitted as the last same-frame pair: {}",
+            keyed_native_submit, m_native_fallback_pair_reuses);
     }
     auto* const native_stereo_hook = ffsr.get();
     const auto record_native_submit = [&](frame_diag::Runtime api, frame_diag::Stage stage,
@@ -2947,7 +2959,7 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
         native_stereo_packet,
         native_frame_ticket,
         native_stereo_hook,
-        save_native_pair = keyed_native_submit && native_stereo_packet != nullptr && native_stereo_packet->keyed,
+        save_native_pair = native_pair_fallback && native_stereo_packet != nullptr,
         this](d3d12::CommandContext& commands, ID3D12Resource* render_target) {
         if (render_target == nullptr || left_source == nullptr || right_source == nullptr || native_stereo_packet == nullptr) {
             return;
@@ -4483,10 +4495,17 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
                             std::nullopt,
                             D3D12_RESOURCE_STATE_RENDER_TARGET,
                             nullptr);
-                    } else if (use_native_last_pair && m_native_last_pair != nullptr &&
+                    } else if ((use_native_last_pair ||
+                                (native_pair_fallback && native_stereo_packet == nullptr &&
+                                 m_native_last_pair_reuses < NATIVE_LAST_PAIR_FALLBACK_MAX_REUSES)) &&
+                               m_native_last_pair != nullptr &&
                                m_native_last_pair_generation != 0 &&
                                m_native_last_pair_generation == m_scene_capture_generation) {
-                        SPDLOG_INFO_ONCE("[NativeStereoFix][Keyed] No right eye for the presented frame; re-submitting the last same-frame eye pair");
+                        if (!use_native_last_pair) {
+                            ++m_native_last_pair_reuses;
+                            ++m_native_fallback_pair_reuses;
+                        }
+                        SPDLOG_INFO_ONCE("[NativeStereoFix] No usable right eye for the presented frame; re-submitting the last same-frame eye pair");
                         m_openxr.copy((uint32_t)runtimes::OpenXR::SwapchainIndex::DOUBLE_WIDE, m_native_last_pair.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, nullptr);
                     } else if (native_stereo_packet == nullptr ||
                                m_scene_capture_tex.texture.Get() == nullptr ||

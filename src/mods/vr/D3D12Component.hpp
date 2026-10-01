@@ -235,6 +235,7 @@ private:
     uint64_t m_native_keyed_hits{};
     uint64_t m_native_keyed_misses{};
     uint64_t m_native_keyed_pair_reuses{};
+    uint64_t m_native_fallback_pair_reuses{};
     void save_native_last_pair(d3d12::CommandContext& commands, ID3D12Resource* render_target);
     uint32_t m_scene_capture_width{};
     uint32_t m_scene_capture_height{};

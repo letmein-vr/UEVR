@@ -852,6 +852,10 @@ public:
     // whose key equals the frame it is presenting (VR::m_frame_count). A single shared slot
     // under r.OneFrameThreadLag=1 handed Present a packet from a different frame.
     bool uses_frame_keyed_native_packets() const;
+    // Stalker 2 UE5.5 Native Fix: on a Present with no usable right-eye packet, re-submit the last
+    // pair whose eyes came from one frame instead of the engine's double-wide target (whose right
+    // half is never rendered by Native Fix: black, or a quarter-size un-upscaled image with DLSS).
+    bool uses_native_last_pair_fallback() const;
     std::shared_ptr<const NativeStereoFramePacket> get_keyed_native_stereo_frame_packet_for_submit(uint32_t submit_key) const;
     void reject_native_stereo_frame_packet(uint64_t serial, const char* detail);
     void observe_native_frame_engine(uint32_t frame);

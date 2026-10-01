@@ -25810,6 +25810,10 @@ FFakeStereoRenderingHook::get_native_stereo_frame_packet_for_submit(int32_t rend
     return packet;
 }
 
+bool FFakeStereoRenderingHook::uses_native_last_pair_fallback() const {
+    return stalker2_uses_validated_ue55_native_fix_capture_layout();
+}
+
 bool FFakeStereoRenderingHook::uses_frame_keyed_native_packets() const {
     // The key is only meaningful when VR::m_frame_count at Present comes from the RHI-ordered
     // command-list pose handoff; the Slate/direct fallbacks set it from the render thread.
