@@ -225,6 +225,17 @@ private:
     bool m_ue58_dedicated_ui_spectator_valid{};
     d3d12::TextureContext m_scene_capture_tex{};
     uint64_t m_scene_capture_generation{};
+    // Frame-keyed Native Fix (Stalker 2): copy of the last double-wide image whose two eyes
+    // came from the same frame. Re-submitted on a frame with no matching right eye so both
+    // eyes stay in sync (a repeated frame) instead of a black or mismatched right eye.
+    ComPtr<ID3D12Resource> m_native_last_pair{};
+    ComPtr<ID3D12Resource> m_native_last_pair_retired{};
+    uint64_t m_native_last_pair_generation{};
+    uint32_t m_native_last_pair_reuses{};
+    uint64_t m_native_keyed_hits{};
+    uint64_t m_native_keyed_misses{};
+    uint64_t m_native_keyed_pair_reuses{};
+    void save_native_last_pair(d3d12::CommandContext& commands, ID3D12Resource* render_target);
     uint32_t m_scene_capture_width{};
     uint32_t m_scene_capture_height{};
     d3d12::TextureContext m_shf_mono_scene_tex{};

@@ -23525,6 +23525,17 @@ void FFakeStereoRenderingHook::localplayer_setup_viewpoint(void* localplayer, vo
     g_hook->m_localplayer_get_viewpoint_hook.call<void>(localplayer, view_info, pass);
 }
 
+// FSceneViewFamily::FrameNumber, the value the render-thread pose handoff keys on.
+std::optional<uint32_t> read_native_family_frame_number(sdk::FSceneViewFamily* family) {
+    const auto offset = SceneViewExtensionAnalyzer::frame_count_offset;
+    const auto address = reinterpret_cast<uintptr_t>(family);
+    if (offset == 0 || address == 0 || !is_readable_process_range(address + offset, sizeof(uint32_t))) {
+        return std::nullopt;
+    }
+
+    return *reinterpret_cast<const uint32_t*>(address + offset);
+}
+
 void FFakeStereoRenderingHook::begin_render_viewfamily_real(void* render_module, sdk::FCanvas* canvas, sdk::FSceneViewFamily* view_family_candidate) {
     ZoneScopedN("BeginRenderViewFamilyReal");
     g_hook->m_render_module_begin_render_viewfamily_observed.store(true, std::memory_order_release);
@@ -24606,8 +24617,16 @@ void FFakeStereoRenderingHook::begin_render_viewfamily_real(void* render_module,
         return;
     }
 
+    // Set by the non-linked path once both eyes are proven to share one FrameNumber.
+    std::optional<uint32_t> keyed_family_frame{};
+
     const auto publish_native_packet = [&]() {
         auto packet = std::make_shared<NativeStereoFramePacket>();
+        if (keyed_family_frame && g_hook->uses_frame_keyed_native_packets()) {
+            packet->keyed = true;
+            packet->submit_key = *keyed_family_frame + static_cast<uint32_t>(g_hook->get_frame_delay_compensation());
+            packet->keyed_epoch = g_hook->m_native_packet_epoch.load(std::memory_order_acquire);
+        }
         packet->capture = native_capture_snapshot;
         packet->family = view_family;
         packet->left_view = native_left_view;
@@ -25032,6 +25051,9 @@ void FFakeStereoRenderingHook::begin_render_viewfamily_real(void* render_module,
             "[Hellblade][NativeStereoFix] Preserving the validated two-view renderer topology for both target transactions");
     }
     call_original();
+    const auto keyed_left_frame = g_hook->uses_frame_keyed_native_packets()
+        ? read_native_family_frame_number(view_family)
+        : std::nullopt;
 
     uint32_t daysgone_first_frame{};
     if (use_daysgone_same_frame_render) {
@@ -25189,6 +25211,21 @@ void FFakeStereoRenderingHook::begin_render_viewfamily_real(void* render_module,
                 daysgone_first_frame,
                 failure_reason != nullptr ? failure_reason : "post-render validation");
             return;
+        }
+    }
+
+    if (keyed_left_frame) {
+        // The scene frame count is decremented before the right render so both eyes share
+        // one FrameNumber; only key the packet when that is proven for this transaction.
+        const auto keyed_right_frame = read_native_family_frame_number(view_family);
+        if (keyed_right_frame && *keyed_right_frame == *keyed_left_frame) {
+            keyed_family_frame = keyed_left_frame;
+        } else {
+            SPDLOG_WARNING_EVERY_N_SEC(
+                2,
+                "[NativeStereoFix][Keyed] Eye FrameNumbers differ (left={} right={}); publishing unkeyed",
+                *keyed_left_frame,
+                keyed_right_frame.value_or(0));
         }
     }
 
@@ -25583,6 +25620,7 @@ void FFakeStereoRenderingHook::invalidate_native_stereo_frame_packet(
     const char* detail)
 {
     m_native_stereo_frame_packet.store(nullptr, std::memory_order_release);
+    m_native_packet_epoch.fetch_add(1, std::memory_order_acq_rel);
     set_native_stereo_fix_state(state, detail);
     if (const auto token = m_native_frame_diagnostics.control()) {
         uevr::native_frame::Event event{};
@@ -25613,6 +25651,9 @@ void FFakeStereoRenderingHook::publish_native_stereo_frame_packet(
         fill_native_frame_packet_event(*observation, *packet);
         observation->stage = uevr::native_frame::Stage::producer;
         observation->thread = GetCurrentThreadId();
+    }
+    if (packet->keyed) {
+        m_native_packet_ring[packet->submit_key % NATIVE_PACKET_RING_SIZE].store(packet, std::memory_order_release);
     }
     m_native_stereo_frame_packet.store(std::move(packet), std::memory_order_release);
     if (observation) {
@@ -25762,9 +25803,52 @@ FFakeStereoRenderingHook::get_native_stereo_frame_packet_for_submit(int32_t rend
     return packet;
 }
 
+bool FFakeStereoRenderingHook::uses_frame_keyed_native_packets() const {
+    // The key is only meaningful when VR::m_frame_count at Present comes from the RHI-ordered
+    // command-list pose handoff; the Slate/direct fallbacks set it from the render thread.
+    return stalker2_uses_validated_ue55_native_fix_capture_layout() &&
+        m_has_successful_command_list_hijack &&
+        SceneViewExtensionAnalyzer::frame_count_offset != 0;
+}
+
+std::shared_ptr<const FFakeStereoRenderingHook::NativeStereoFramePacket>
+FFakeStereoRenderingHook::get_keyed_native_stereo_frame_packet_for_submit(uint32_t submit_key) const {
+    const auto vr = VR::get();
+    if (vr == nullptr || !vr->is_native_stereo_fix_enabled()) {
+        return nullptr;
+    }
+
+    const auto packet = m_native_packet_ring[submit_key % NATIVE_PACKET_RING_SIZE].load(std::memory_order_acquire);
+    if (packet == nullptr || packet->capture == nullptr || !packet->keyed || packet->submit_key != submit_key ||
+        packet->keyed_epoch != m_native_packet_epoch.load(std::memory_order_acquire) ||
+        packet->capture_generation == m_native_stereo_rejected_capture_generation.load(std::memory_order_acquire))
+    {
+        return nullptr;
+    }
+
+    // Same resource identity checks as the frame-window path.
+    const auto rtm = const_cast<FFakeStereoRenderingHook*>(this)->get_render_target_manager();
+    const auto current_capture = rtm != nullptr ? rtm->get_scene_capture_target_snapshot() : nullptr;
+    if (current_capture == nullptr ||
+        current_capture->generation != packet->capture_generation ||
+        current_capture->generation != packet->capture->generation ||
+        current_capture->rhi_texture != packet->capture->rhi_texture ||
+        current_capture->native_resource.Get() != packet->capture->native_resource.Get())
+    {
+        return nullptr;
+    }
+
+    return packet;
+}
+
 void FFakeStereoRenderingHook::note_native_stereo_frame_packet_consumed(uint64_t serial) {
     const auto packet = m_native_stereo_frame_packet.load(std::memory_order_acquire);
     if (packet == nullptr || packet->serial != serial) {
+        // Keyed submission legitimately consumes a ring packet older than the newest slot.
+        if (uses_frame_keyed_native_packets() && serial > m_native_stereo_consumed_serial.load(std::memory_order_acquire)) {
+            m_native_stereo_consumed_serial.store(serial, std::memory_order_release);
+            set_native_stereo_fix_state(NativeStereoFixState::Active, "validated right-eye resource submitted");
+        }
         return;
     }
 
@@ -25793,6 +25877,7 @@ void FFakeStereoRenderingHook::reject_native_stereo_frame_packet(uint64_t serial
     }
 
     m_native_stereo_rejected_capture_generation.store(rejected_generation, std::memory_order_release);
+    m_native_packet_epoch.fetch_add(1, std::memory_order_acq_rel);
     set_native_stereo_fix_state(NativeStereoFixState::FailedClosed, detail);
     if (const auto token = m_native_frame_diagnostics.control()) {
         uevr::native_frame::Event event{};

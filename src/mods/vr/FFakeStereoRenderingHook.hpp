@@ -828,6 +828,12 @@ public:
         int32_t player_index{-1};
         uint32_t left_pass{};
         uint32_t right_pass{};
+        // Frame-keyed submission (Stalker 2 UE5.5): the FSceneViewFamily FrameNumber both
+        // eyes rendered with, plus the delay compensation, i.e. the same value the RHI pose
+        // handoff publishes as internal_render_frame_count for the Present of that frame.
+        bool keyed{};
+        uint32_t submit_key{};
+        uint64_t keyed_epoch{};
         // Observation only; never used to accept a packet or retime a frame.
         uevr::native_frame::ClockStamp diagnostic_clock{};
     };
@@ -838,6 +844,12 @@ public:
         int32_t render_frame, uevr::native_frame::Backend backend = uevr::native_frame::Backend::unknown,
         uevr::native_frame::Ticket* diagnostic_ticket = nullptr) const;
     void note_native_stereo_frame_packet_consumed(uint64_t serial);
+    // Stalker 2 UE5.5 + D3D12 + RHI command-list pose handoff: right-eye packets are kept in a
+    // small ring keyed by the frame they were rendered for, and Present takes only the packet
+    // whose key equals the frame it is presenting (VR::m_frame_count). A single shared slot
+    // under r.OneFrameThreadLag=1 handed Present a packet from a different frame.
+    bool uses_frame_keyed_native_packets() const;
+    std::shared_ptr<const NativeStereoFramePacket> get_keyed_native_stereo_frame_packet_for_submit(uint32_t submit_key) const;
     void reject_native_stereo_frame_packet(uint64_t serial, const char* detail);
     void observe_native_frame_engine(uint32_t frame);
     void observe_native_frame_present(int32_t frame);
@@ -1440,6 +1452,10 @@ private:
     std::atomic<std::shared_ptr<const NativeStereoFramePacket>> m_native_stereo_frame_packet{};
     std::atomic<uint64_t> m_native_stereo_packet_serial{};
     std::atomic<uint64_t> m_native_stereo_consumed_serial{};
+    static constexpr size_t NATIVE_PACKET_RING_SIZE = 8;
+    std::array<std::atomic<std::shared_ptr<const NativeStereoFramePacket>>, NATIVE_PACKET_RING_SIZE> m_native_packet_ring{};
+    // Bumped on every invalidation so ring entries published before it can never be selected.
+    std::atomic<uint64_t> m_native_packet_epoch{1};
     std::atomic<uint64_t> m_native_stereo_rejected_capture_generation{};
     mutable uevr::native_frame::Recorder<> m_native_frame_diagnostics{};
     std::atomic<uint64_t> m_native_stereo_ue57_capability_failure_generation{};

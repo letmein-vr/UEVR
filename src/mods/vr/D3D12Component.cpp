@@ -1113,6 +1113,60 @@ bool D3D12Component::ensure_ue58_slate_ui_consumer_fence(ID3D12Device* device) {
     return true;
 }
 
+void D3D12Component::save_native_last_pair(d3d12::CommandContext& commands, ID3D12Resource* render_target) {
+    if (render_target == nullptr) {
+        return;
+    }
+
+    const auto target_desc = render_target->GetDesc();
+    const auto matches_target = [&]() {
+        if (m_native_last_pair == nullptr) {
+            return false;
+        }
+
+        const auto desc = m_native_last_pair->GetDesc();
+        return desc.Width == target_desc.Width && desc.Height == target_desc.Height &&
+            desc.Format == target_desc.Format && desc.DepthOrArraySize == target_desc.DepthOrArraySize &&
+            desc.MipLevels == target_desc.MipLevels && desc.SampleDesc.Count == target_desc.SampleDesc.Count;
+    };
+
+    if (!matches_target()) {
+        ComPtr<ID3D12Device> device{};
+        if (FAILED(render_target->GetDevice(IID_PPV_ARGS(&device))) || device == nullptr) {
+            return;
+        }
+
+        D3D12_HEAP_PROPERTIES heap_props{};
+        heap_props.Type = D3D12_HEAP_TYPE_DEFAULT;
+        heap_props.CPUPageProperty = D3D12_CPU_PAGE_PROPERTY_UNKNOWN;
+        heap_props.MemoryPoolPreference = D3D12_MEMORY_POOL_UNKNOWN;
+
+        auto desc = target_desc;
+        desc.Flags |= D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+
+        ComPtr<ID3D12Resource> pair{};
+        if (FAILED(device->CreateCommittedResource(&heap_props, D3D12_HEAP_FLAG_NONE, &desc,
+                D3D12_RESOURCE_STATE_RENDER_TARGET, nullptr, IID_PPV_ARGS(&pair))))
+        {
+            SPDLOG_ERROR_EVERY_N_SEC(2, "[NativeStereoFix][Keyed] Failed to create the last-pair texture");
+            return;
+        }
+
+        pair->SetName(L"Native Stereo Last Same-Frame Pair");
+        // Earlier copies may still reference the old texture on the GPU; keep it alive one more
+        // recreation (recreation only happens on a swapchain size/format change).
+        m_native_last_pair_retired = std::move(m_native_last_pair);
+        m_native_last_pair = std::move(pair);
+        m_native_last_pair_generation = 0;
+        SPDLOG_INFO("[NativeStereoFix][Keyed] Created last-pair texture {}x{} format {}",
+            target_desc.Width, target_desc.Height, static_cast<uint32_t>(target_desc.Format));
+    }
+
+    commands.copy(render_target, m_native_last_pair.Get(),
+        D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_RENDER_TARGET);
+    m_native_last_pair_generation = m_scene_capture_generation;
+}
+
 void D3D12Component::wait_for_ue58_slate_ui_consumers() {
     if (m_ue58_converted_ui_consumer_fence == nullptr ||
         m_ue58_converted_ui_consumer_fence_value == 0 ||
@@ -2202,9 +2256,47 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
     const auto frame_count = vr->m_render_frame_count;
     namespace frame_diag = uevr::native_frame;
     frame_diag::Ticket native_frame_ticket{};
-    auto native_stereo_packet = ffsr != nullptr
-        ? ffsr->get_native_stereo_frame_packet_for_submit(frame_count, frame_diag::Backend::d3d12, &native_frame_ticket)
-        : nullptr;
+    // Frame-keyed Native Fix (Stalker 2 UE5.5): take only the right eye rendered for the frame
+    // being presented. On a miss, re-submit the last same-frame pair (both eyes) for a few frames
+    // rather than a black or mismatched right eye, then fall back to the frame-window path.
+    constexpr uint32_t NATIVE_LAST_PAIR_MAX_REUSES = 3;
+    const bool keyed_native_submit = ffsr != nullptr && ffsr->uses_frame_keyed_native_packets();
+    bool use_native_last_pair = false;
+    decltype(ffsr->get_native_stereo_frame_packet_for_submit(0)) native_stereo_packet{};
+
+    if (keyed_native_submit) {
+        native_stereo_packet = ffsr->get_keyed_native_stereo_frame_packet_for_submit(static_cast<uint32_t>(vr->m_frame_count));
+
+        if (native_stereo_packet != nullptr) {
+            ++m_native_keyed_hits;
+            m_native_last_pair_reuses = 0;
+        } else {
+            ++m_native_keyed_misses;
+
+            if (m_native_last_pair != nullptr && m_native_last_pair_generation != 0 &&
+                m_native_last_pair_generation == m_scene_capture_generation &&
+                m_native_last_pair_reuses < NATIVE_LAST_PAIR_MAX_REUSES)
+            {
+                ++m_native_last_pair_reuses;
+                ++m_native_keyed_pair_reuses;
+                use_native_last_pair = true;
+            } else {
+                native_stereo_packet = ffsr->get_native_stereo_frame_packet_for_submit(
+                    frame_count, frame_diag::Backend::d3d12, &native_frame_ticket);
+            }
+        }
+
+        SPDLOG_INFO_EVERY_N_SEC(
+            10,
+            "[NativeStereoFix][Keyed] present_frame={} hits={} misses={} same-frame pair reuses={}",
+            vr->m_frame_count,
+            m_native_keyed_hits,
+            m_native_keyed_misses,
+            m_native_keyed_pair_reuses);
+    } else if (ffsr != nullptr) {
+        native_stereo_packet = ffsr->get_native_stereo_frame_packet_for_submit(
+            frame_count, frame_diag::Backend::d3d12, &native_frame_ticket);
+    }
     auto* const native_stereo_hook = ffsr.get();
     const auto record_native_submit = [&](frame_diag::Runtime api, frame_diag::Stage stage,
         int32_t result = 0, uint8_t eye = 2, uint8_t call = 0) {
@@ -2709,6 +2801,7 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
         m_scene_capture_generation = 0;
         m_scene_capture_width = 0;
         m_scene_capture_height = 0;
+        m_native_last_pair_generation = 0;
     };
 
     if (vr->is_native_stereo_fix_enabled() && native_stereo_packet != nullptr) {
@@ -2853,7 +2946,9 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
         nascar25_native_copy_states,
         native_stereo_packet,
         native_frame_ticket,
-        native_stereo_hook](d3d12::CommandContext& commands, ID3D12Resource* render_target) {
+        native_stereo_hook,
+        save_native_pair = keyed_native_submit && native_stereo_packet != nullptr && native_stereo_packet->keyed,
+        this](d3d12::CommandContext& commands, ID3D12Resource* render_target) {
         if (render_target == nullptr || left_source == nullptr || right_source == nullptr || native_stereo_packet == nullptr) {
             return;
         }
@@ -2888,6 +2983,10 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
                 D3D12_RESOURCE_STATE_RENDER_TARGET,
                 D3D12_RESOURCE_STATE_RENDER_TARGET
             );
+        }
+
+        if (save_native_pair) {
+            save_native_last_pair(commands, render_target);
         }
 
         if (native_stereo_hook != nullptr) {
@@ -4384,6 +4483,11 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
                             std::nullopt,
                             D3D12_RESOURCE_STATE_RENDER_TARGET,
                             nullptr);
+                    } else if (use_native_last_pair && m_native_last_pair != nullptr &&
+                               m_native_last_pair_generation != 0 &&
+                               m_native_last_pair_generation == m_scene_capture_generation) {
+                        SPDLOG_INFO_ONCE("[NativeStereoFix][Keyed] No right eye for the presented frame; re-submitting the last same-frame eye pair");
+                        m_openxr.copy((uint32_t)runtimes::OpenXR::SwapchainIndex::DOUBLE_WIDE, m_native_last_pair.Get(), D3D12_RESOURCE_STATE_RENDER_TARGET, nullptr);
                     } else if (native_stereo_packet == nullptr ||
                                m_scene_capture_tex.texture.Get() == nullptr ||
                                shf_using_mono_expansion ||
