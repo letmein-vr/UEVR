@@ -144,6 +144,27 @@ bool is_windrose_ue56_dx12_current_game_for_cvars() {
     return result;
 }
 
+// UESDK writes cvars at 0x08000000. On UE 5.5 (EConsoleVariableFlags with the
+// PluginLowPriority/PluginHighPriority entries, verified in the Stalker 2 binary) that is
+// SetByGameOverride, below SetByCode (0x0D000000), so a game that applies its own settings
+// from code (Stalker 2's r.Tonemapper.Sharpen) silently ignores every frozen write.
+// SetByConsole (0x0E000000) is what the in-game console uses and outranks everything.
+constexpr uint32_t SET_BY_DEFAULT = 0x08000000;
+constexpr uint32_t SET_BY_CONSOLE_UE55 = 0x0E000000;
+
+bool supports_ue55_console_set_by() {
+    static const bool result = []() {
+        if (const auto found_version = sdk::search_for_version(utility::get_executable())) {
+            const auto version = utility::narrow(*found_version);
+            return version == "5.5" || version.starts_with("5.5.");
+        }
+
+        return sdk::get_file_version_info().dwFileVersionMS == 0x00050005;
+    }();
+
+    return result;
+}
+
 bool propagate_alpha_allows_tonemapper_value() {
     static const bool result = []() {
         int major{};
@@ -554,6 +575,30 @@ void CVarManager::CVar::finish_ui_write(uint64_t request_id, bool callable) {
     if (m_write_observation.dispatched(request_id, callable, diagnostic_now_ms())) {
         s_pending_ui_readbacks.store(true, std::memory_order_release);
     }
+}
+
+uint32_t CVarManager::CVar::get_set_by_flags() const {
+    return m_set_by_escalated ? SET_BY_CONSOLE_UE55 : SET_BY_DEFAULT;
+}
+
+void CVarManager::CVar::note_freeze_enforce(bool needed_set) {
+    // A freeze write that is still not holding on the following ticks was outranked
+    // (or overwritten) by the game. After a few in a row, write at Console priority,
+    // which the game's own SetByCode writes cannot override. Sticky for the session.
+    constexpr uint32_t ESCALATE_AFTER_UNHELD_SETS = 3;
+
+    if (!needed_set) {
+        m_unheld_freeze_sets = 0;
+        return;
+    }
+
+    if (m_set_by_escalated || ++m_unheld_freeze_sets < ESCALATE_AFTER_UNHELD_SETS || !supports_ue55_console_set_by()) {
+        return;
+    }
+
+    m_set_by_escalated = true;
+    SPDLOG_INFO("[CVarManager] \"{}\" did not hold after {} writes (game sets it at a higher priority); writing at Console priority",
+        utility::narrow(m_name), m_unheld_freeze_sets);
 }
 
 uevr::cvar_diagnostics::WriteObservation CVarManager::CVar::get_write_observation() const {
@@ -1422,7 +1467,7 @@ void CVarManager::CVarStandard::freeze() {
         uevr::perf::FrameProfiler::Scope _perf{slot_it->second};
 
         const auto start = std::chrono::steady_clock::now();
-        const auto ok = cvar->Set(value.c_str());
+        const auto ok = cvar->Set(value.c_str(), get_set_by_flags());
         const auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count();
 
         if (!ok) {
@@ -1451,6 +1496,8 @@ void CVarManager::CVarStandard::freeze() {
     default:
         break;
     };
+
+    note_freeze_enforce(needs_enforce);
 
     if (!needs_enforce) {
         // The value is holding; a later drift starts a fresh run before any throttling applies.
@@ -1515,7 +1562,7 @@ void CVarManager::CVarStandard::draw_ui() try {
             const auto request = begin_ui_write(static_cast<int>(value));
             GameThreadWorker::get().enqueue([sft = std::static_pointer_cast<CVarStandard>(shared_from_this()), cvar, value, request]() {
                 try {
-                    const auto callable = cvar->Set(std::to_wstring((int)value).c_str());
+                    const auto callable = cvar->Set(std::to_wstring((int)value).c_str(), sft->get_set_by_flags());
                     sft->finish_ui_write(request, callable);
                     if (callable) {
                         sft->m_setter_unavailable = false;
@@ -1544,7 +1591,7 @@ void CVarManager::CVarStandard::draw_ui() try {
             const auto request = begin_ui_write(value);
             GameThreadWorker::get().enqueue([sft = std::static_pointer_cast<CVarStandard>(shared_from_this()), cvar, value, request]() {
                 try {
-                    const auto callable = cvar->Set(std::to_wstring(value).c_str());
+                    const auto callable = cvar->Set(std::to_wstring(value).c_str(), sft->get_set_by_flags());
                     sft->finish_ui_write(request, callable);
                     if (callable) {
                         sft->m_setter_unavailable = false;
@@ -1573,7 +1620,7 @@ void CVarManager::CVarStandard::draw_ui() try {
             const auto request = begin_ui_write(value);
             GameThreadWorker::get().enqueue([sft = std::static_pointer_cast<CVarStandard>(shared_from_this()), cvar, value, request]() {
                 try {
-                    const auto callable = cvar->Set(std::to_wstring(value).c_str());
+                    const auto callable = cvar->Set(std::to_wstring(value).c_str(), sft->get_set_by_flags());
                     sft->finish_ui_write(request, callable);
                     if (callable) {
                         sft->m_setter_unavailable = false;
@@ -1692,9 +1739,11 @@ void CVarManager::CVarData::freeze() {
             break;
         }
 
+        note_freeze_enforce(needs_set);
+
         if (needs_set) {
             const auto start = std::chrono::steady_clock::now();
-            const auto ok = m_interface_cvar->Set(value.c_str());
+            const auto ok = m_interface_cvar->Set(value.c_str(), get_set_by_flags());
             const auto elapsed_ms =
                 std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count();
 
@@ -1770,7 +1819,7 @@ void CVarManager::CVarData::draw_ui() try {
             GameThreadWorker::get().enqueue(
                 [sft = std::static_pointer_cast<CVarData>(shared_from_this()), cvar, value = std::move(value), request]() {
                     try {
-                        const auto callable = cvar->Set(value.c_str());
+                        const auto callable = cvar->Set(value.c_str(), sft->get_set_by_flags());
                         sft->finish_ui_write(request, callable);
                         if (!callable) {
                             sft->m_setter_unavailable = true;

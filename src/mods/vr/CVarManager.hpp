@@ -135,6 +135,10 @@ public:
         int clamp_int_value(int value) const;
         float clamp_float_value(float value) const;
         int effective_max_int_value() const;
+        // SetBy priority for freeze writes. Starts at the UESDK default and is raised to
+        // Console priority once the game has outranked repeated writes (see CVarManager.cpp).
+        uint32_t get_set_by_flags() const;
+        void note_freeze_enforce(bool needed_set);
 
         std::wstring m_module{};
         std::wstring m_name{};
@@ -157,6 +161,8 @@ public:
 
         bool m_frozen{false};
         bool m_ever_frozen{false};
+        uint32_t m_unheld_freeze_sets{0};
+        bool m_set_by_escalated{false};
         mutable std::mutex m_write_observation_mutex{};
         uevr::cvar_diagnostics::WriteObservation m_write_observation{};
     };
