@@ -24617,14 +24617,17 @@ void FFakeStereoRenderingHook::begin_render_viewfamily_real(void* render_module,
         return;
     }
 
-    // Set by the non-linked path once both eyes are proven to share one FrameNumber.
-    std::optional<uint32_t> keyed_family_frame{};
+    // Set by the non-linked path: the FrameNumbers of this transaction's PRIMARY and
+    // SECONDARY renders (equal, or SECONDARY = PRIMARY + 1 on Stalker 2).
+    std::optional<std::pair<uint32_t, uint32_t>> keyed_family_frames{};
 
     const auto publish_native_packet = [&]() {
         auto packet = std::make_shared<NativeStereoFramePacket>();
-        if (keyed_family_frame && g_hook->uses_frame_keyed_native_packets()) {
+        if (keyed_family_frames && g_hook->uses_frame_keyed_native_packets()) {
+            const auto compensation = static_cast<uint32_t>(g_hook->get_frame_delay_compensation());
             packet->keyed = true;
-            packet->submit_key = *keyed_family_frame + static_cast<uint32_t>(g_hook->get_frame_delay_compensation());
+            packet->submit_key = keyed_family_frames->first + compensation;
+            packet->submit_key_alt = keyed_family_frames->second + compensation;
             packet->keyed_epoch = g_hook->m_native_packet_epoch.load(std::memory_order_acquire);
         }
         packet->capture = native_capture_snapshot;
@@ -25215,15 +25218,16 @@ void FFakeStereoRenderingHook::begin_render_viewfamily_real(void* render_module,
     }
 
     if (keyed_left_frame) {
-        // The scene frame count is decremented before the right render so both eyes share
-        // one FrameNumber; only key the packet when that is proven for this transaction.
+        // Both renders of this transaction; the next frame starts at left+2, so neither key can
+        // collide with another frame. Anything else is not a proven single transaction.
         const auto keyed_right_frame = read_native_family_frame_number(view_family);
-        if (keyed_right_frame && *keyed_right_frame == *keyed_left_frame) {
-            keyed_family_frame = keyed_left_frame;
+        if (keyed_right_frame &&
+            (*keyed_right_frame == *keyed_left_frame || *keyed_right_frame == *keyed_left_frame + 1u)) {
+            keyed_family_frames = std::make_pair(*keyed_left_frame, *keyed_right_frame);
         } else {
             SPDLOG_WARNING_EVERY_N_SEC(
                 2,
-                "[NativeStereoFix][Keyed] Eye FrameNumbers differ (left={} right={}); publishing unkeyed",
+                "[NativeStereoFix][Keyed] Eye FrameNumbers are not one transaction (left={} right={}); publishing unkeyed",
                 *keyed_left_frame,
                 keyed_right_frame.value_or(0));
         }
@@ -25654,6 +25658,9 @@ void FFakeStereoRenderingHook::publish_native_stereo_frame_packet(
     }
     if (packet->keyed) {
         m_native_packet_ring[packet->submit_key % NATIVE_PACKET_RING_SIZE].store(packet, std::memory_order_release);
+        if (packet->submit_key_alt != packet->submit_key) {
+            m_native_packet_ring[packet->submit_key_alt % NATIVE_PACKET_RING_SIZE].store(packet, std::memory_order_release);
+        }
     }
     m_native_stereo_frame_packet.store(std::move(packet), std::memory_order_release);
     if (observation) {
@@ -25819,7 +25826,19 @@ FFakeStereoRenderingHook::get_keyed_native_stereo_frame_packet_for_submit(uint32
     }
 
     const auto packet = m_native_packet_ring[submit_key % NATIVE_PACKET_RING_SIZE].load(std::memory_order_acquire);
-    if (packet == nullptr || packet->capture == nullptr || !packet->keyed || packet->submit_key != submit_key ||
+    if (packet != nullptr && packet->keyed && packet->submit_key != submit_key && packet->submit_key_alt != submit_key) {
+        const auto newest = m_native_stereo_frame_packet.load(std::memory_order_acquire);
+        SPDLOG_INFO_EVERY_N_SEC(
+            5,
+            "[NativeStereoFix][Keyed] Miss present_key={} slot_keys={}/{} newest_keys={}/{}",
+            submit_key,
+            packet->submit_key,
+            packet->submit_key_alt,
+            newest != nullptr ? newest->submit_key : 0,
+            newest != nullptr ? newest->submit_key_alt : 0);
+    }
+    if (packet == nullptr || packet->capture == nullptr || !packet->keyed ||
+        (packet->submit_key != submit_key && packet->submit_key_alt != submit_key) ||
         packet->keyed_epoch != m_native_packet_epoch.load(std::memory_order_acquire) ||
         packet->capture_generation == m_native_stereo_rejected_capture_generation.load(std::memory_order_acquire))
     {

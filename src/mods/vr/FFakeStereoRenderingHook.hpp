@@ -831,8 +831,11 @@ public:
         // Frame-keyed submission (Stalker 2 UE5.5): the FSceneViewFamily FrameNumber both
         // eyes rendered with, plus the delay compensation, i.e. the same value the RHI pose
         // handoff publishes as internal_render_frame_count for the Present of that frame.
+        // On Stalker 2 the SECONDARY render gets FrameNumber left+1 (the scene decrement does not
+        // hold), and the pose handoff ends on the later one, so a packet answers to both keys.
         bool keyed{};
         uint32_t submit_key{};
+        uint32_t submit_key_alt{};
         uint64_t keyed_epoch{};
         // Observation only; never used to accept a packet or retime a frame.
         uevr::native_frame::ClockStamp diagnostic_clock{};
@@ -1452,7 +1455,7 @@ private:
     std::atomic<std::shared_ptr<const NativeStereoFramePacket>> m_native_stereo_frame_packet{};
     std::atomic<uint64_t> m_native_stereo_packet_serial{};
     std::atomic<uint64_t> m_native_stereo_consumed_serial{};
-    static constexpr size_t NATIVE_PACKET_RING_SIZE = 8;
+    static constexpr size_t NATIVE_PACKET_RING_SIZE = 16;
     std::array<std::atomic<std::shared_ptr<const NativeStereoFramePacket>>, NATIVE_PACKET_RING_SIZE> m_native_packet_ring{};
     // Bumped on every invalidation so ring entries published before it can never be selected.
     std::atomic<uint64_t> m_native_packet_epoch{1};
