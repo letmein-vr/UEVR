@@ -6367,9 +6367,12 @@ bool is_probable_d3d_native_resource(void* native) {
 
     auto module_path_lower = std::string(*module_path);
     std::transform(module_path_lower.begin(), module_path_lower.end(), module_path_lower.begin(), ::tolower);
+    // renderdoc.dll: embedded RenderDoc wraps every D3D12 object, so the wrapped resource's
+    // vtable lives there (same reason as UESDK FRHITexture::get_native_resource).
     return module_path_lower.ends_with("d3d12.dll") ||
         module_path_lower.ends_with("d3d12core.dll") ||
         module_path_lower.ends_with("dxgi.dll") ||
+        module_path_lower.ends_with("renderdoc.dll") ||
         module_path_lower.ends_with("d3d12sdklayers.dll");
 }
 
