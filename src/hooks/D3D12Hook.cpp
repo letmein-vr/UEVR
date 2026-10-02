@@ -10,6 +10,7 @@
 #include <utility/Module.hpp>
 #include <utility/RTTI.hpp>
 #include <utility/String.hpp>
+#include <utility/Logging.hpp>
 
 #include "WindowFilter.hpp"
 #include "Framework.hpp"
@@ -993,11 +994,36 @@ void renderdoc_update_active_pair_on_present(IDXGISwapChain3* swap_chain) {
 
     uevr::renderdoc_capture::CapturePair pair{};
     pair.device = (g_d3d12_hook != nullptr) ? static_cast<void*>(g_d3d12_hook->get_device()) : nullptr;
-    if (swap_chain != nullptr) {
-        DXGI_SWAP_CHAIN_DESC sc_desc{};
-        if (SUCCEEDED(swap_chain->GetDesc(&sc_desc))) {
-            pair.window = static_cast<void*>(sc_desc.OutputWindow);
+
+    // The hook's device is only filled inside present_internal, and on Stalker 2
+    // GetDesc().OutputWindow came back empty, so the pair was never complete and
+    // RenderDoc's wildcard capture picked the OpenXR runtime's D3D11 device.
+    // Ask the (RenderDoc-wrapped) swapchain directly.
+    if (pair.device == nullptr && swap_chain != nullptr) {
+        Microsoft::WRL::ComPtr<ID3D12Device> device{};
+        if (SUCCEEDED(swap_chain->GetDevice(IID_PPV_ARGS(&device)))) {
+            pair.device = device.Get();
         }
+    }
+
+    if (swap_chain != nullptr) {
+        HWND hwnd{};
+        if (SUCCEEDED(swap_chain->GetHwnd(&hwnd)) && hwnd != nullptr) {
+            pair.window = static_cast<void*>(hwnd);
+        } else {
+            DXGI_SWAP_CHAIN_DESC sc_desc{};
+            if (SUCCEEDED(swap_chain->GetDesc(&sc_desc))) {
+                pair.window = static_cast<void*>(sc_desc.OutputWindow);
+            }
+        }
+    }
+
+    if (pair.device == nullptr || pair.window == nullptr) {
+        SPDLOG_WARNING_EVERY_N_SEC(10, "[RenderDoc] Present has an incomplete capture pair device={:x} window={:x}",
+            (uintptr_t)pair.device, (uintptr_t)pair.window);
+    } else {
+        SPDLOG_INFO_ONCE("[RenderDoc] Publishing capture pair device={:x} window={:x}",
+            (uintptr_t)pair.device, (uintptr_t)pair.window);
     }
 
     if (pair.device != nullptr || pair.window != nullptr) {
