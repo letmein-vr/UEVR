@@ -200,6 +200,235 @@ NVSDK_NGX_Result hk_NVSDK_NGX_D3D12_EvaluateFeature(
     return result;
 }
 
+// DIAGNOSTIC (Stalker 2 quarter-size right eye, strip before release): passive NGX
+// probe. Records each DLSS feature's creation sizes and checks every evaluation
+// against them, so a right-eye evaluation running on a feature created for other
+// sizes (or with a 1:1 render/output ratio) shows up in the log. Never changes a call.
+namespace ngx_probe {
+struct FeatureInfo {
+    int feature_id{};
+    unsigned int width{}, height{}, out_width{}, out_height{};
+    int perf_quality{}, create_flags{};
+    uint64_t created_seq{};
+};
+
+struct EvalSignature {
+    unsigned int render_w{}, render_h{};
+    uint64_t color_w{}, output_w{};
+    unsigned int color_h{}, output_h{};
+    unsigned int in_x{}, in_y{}, out_x{}, out_y{};
+    float mv_x{}, mv_y{};
+    bool operator==(const EvalSignature&) const = default;
+};
+
+struct HandleStats {
+    FeatureInfo info{};
+    bool known{};
+    uint64_t calls{}, resets{}, mismatches{};
+    std::vector<std::pair<EvalSignature, uint64_t>> signatures{};
+};
+
+std::mutex g_mutex{};
+std::unordered_map<uintptr_t, HandleStats> g_handles{};
+uint64_t g_seq{};
+ULONGLONG g_last_summary_ms{};
+SafetyHookInline g_create_hook{}, g_release_hook{}, g_evaluate_hook{};
+
+uint32_t render_frame() {
+    const auto& vr = VR::get();
+    return vr != nullptr ? static_cast<uint32_t>(vr->get_render_frame_count()) : 0u;
+}
+
+void on_create(NVSDK_NGX_Feature feature, NVSDK_NGX_Parameter* params, NVSDK_NGX_Handle** out_handle, NVSDK_NGX_Result result) {
+    if (params == nullptr || out_handle == nullptr || *out_handle == nullptr) {
+        return;
+    }
+
+    FeatureInfo info{};
+    info.feature_id = static_cast<int>(feature);
+    params->Get("Width", &info.width);
+    params->Get("Height", &info.height);
+    params->Get("OutWidth", &info.out_width);
+    params->Get("OutHeight", &info.out_height);
+    params->Get("PerfQualityValue", &info.perf_quality);
+    params->Get(NVSDK_NGX_Parameter_DLSS_Feature_Create_Flags, &info.create_flags);
+
+    std::scoped_lock lock{g_mutex};
+    info.created_seq = ++g_seq;
+    auto& stats = g_handles[reinterpret_cast<uintptr_t>(*out_handle)];
+    stats = HandleStats{};
+    stats.info = info;
+    stats.known = true;
+    spdlog::info(
+        "[NGXProbe] CREATE #{} handle={:x} id={} feature={} render={}x{} out={}x{} perf={} flags=0x{:x} result=0x{:x} render_frame={}",
+        info.created_seq, reinterpret_cast<uintptr_t>(*out_handle), (*out_handle)->Id, info.feature_id,
+        info.width, info.height, info.out_width, info.out_height, info.perf_quality, info.create_flags,
+        static_cast<uint32_t>(result), render_frame());
+}
+
+void on_release(NVSDK_NGX_Handle* handle) {
+    std::scoped_lock lock{g_mutex};
+    const auto it = g_handles.find(reinterpret_cast<uintptr_t>(handle));
+    spdlog::info("[NGXProbe] RELEASE handle={:x} created_seq={} calls={} resets={} mismatches={} render_frame={}",
+        reinterpret_cast<uintptr_t>(handle),
+        it != g_handles.end() ? it->second.info.created_seq : 0,
+        it != g_handles.end() ? it->second.calls : 0,
+        it != g_handles.end() ? it->second.resets : 0,
+        it != g_handles.end() ? it->second.mismatches : 0,
+        render_frame());
+    if (it != g_handles.end()) {
+        g_handles.erase(it);
+    }
+}
+
+void on_evaluate(const NVSDK_NGX_Handle* handle, NVSDK_NGX_Parameter* params) {
+    if (handle == nullptr || params == nullptr) {
+        return;
+    }
+
+    ID3D12Resource* color{};
+    ID3D12Resource* output{};
+    EvalSignature sig{};
+    int reset{};
+    params->Get(NVSDK_NGX_Parameter_Color, &color);
+    params->Get(NVSDK_NGX_Parameter_Output, &output);
+    params->Get(NVSDK_NGX_Parameter_DLSS_Render_Subrect_Dimensions_Width, &sig.render_w);
+    params->Get(NVSDK_NGX_Parameter_DLSS_Render_Subrect_Dimensions_Height, &sig.render_h);
+    params->Get("DLSS.Input.Color.Subrect.Base.X", &sig.in_x);
+    params->Get("DLSS.Input.Color.Subrect.Base.Y", &sig.in_y);
+    params->Get("DLSS.Output.Subrect.Base.X", &sig.out_x);
+    params->Get("DLSS.Output.Subrect.Base.Y", &sig.out_y);
+    params->Get(NVSDK_NGX_Parameter_MV_Scale_X, &sig.mv_x);
+    params->Get(NVSDK_NGX_Parameter_MV_Scale_Y, &sig.mv_y);
+    params->Get("Reset", &reset);
+    if (color != nullptr) {
+        const auto desc = color->GetDesc();
+        sig.color_w = desc.Width;
+        sig.color_h = desc.Height;
+    }
+    if (output != nullptr) {
+        const auto desc = output->GetDesc();
+        sig.output_w = desc.Width;
+        sig.output_h = desc.Height;
+    }
+
+    std::scoped_lock lock{g_mutex};
+    const auto key = reinterpret_cast<uintptr_t>(handle);
+    auto& stats = g_handles[key];
+    ++stats.calls;
+    if (reset != 0) {
+        ++stats.resets;
+        spdlog::info("[NGXProbe] RESET handle={:x} call={} render_frame={}", key, stats.calls, render_frame());
+    }
+
+    // The feature must have been created for exactly this render subrect -> output.
+    const bool mismatch = stats.known &&
+        (sig.render_w > stats.info.width || sig.render_h > stats.info.height ||
+         sig.output_w < stats.info.out_width || sig.output_h < stats.info.out_height ||
+         stats.info.width == stats.info.out_width || sig.render_w * 2 > static_cast<unsigned int>(sig.output_w));
+    if (mismatch) {
+        ++stats.mismatches;
+        if (stats.mismatches <= 20 || stats.mismatches % 500 == 0) {
+            spdlog::info(
+                "[NGXProbe] MISMATCH #{} handle={:x} created render={}x{} out={}x{} but eval render={}x{} color={}x{} output={}x{} render_frame={}",
+                stats.mismatches, key, stats.info.width, stats.info.height, stats.info.out_width, stats.info.out_height,
+                sig.render_w, sig.render_h, sig.color_w, sig.color_h, sig.output_w, sig.output_h, render_frame());
+        }
+    }
+
+    auto it = std::find_if(stats.signatures.begin(), stats.signatures.end(),
+        [&](const auto& entry) { return entry.first == sig; });
+    if (it == stats.signatures.end()) {
+        if (stats.signatures.size() < 32) {
+            stats.signatures.emplace_back(sig, 1);
+        }
+        spdlog::info(
+            "[NGXProbe] NEW eval signature handle={:x} (created render={}x{} out={}x{} known={}) render={}x{} in_base={},{} out_base={},{} "
+            "color={}x{} output={}x{} mv_scale={:.3f},{:.3f} render_frame={}",
+            key, stats.info.width, stats.info.height, stats.info.out_width, stats.info.out_height, stats.known,
+            sig.render_w, sig.render_h, sig.in_x, sig.in_y, sig.out_x, sig.out_y,
+            sig.color_w, sig.color_h, sig.output_w, sig.output_h, sig.mv_x, sig.mv_y, render_frame());
+    } else {
+        ++it->second;
+    }
+
+    const auto now = GetTickCount64();
+    if (now - g_last_summary_ms >= 10000) {
+        g_last_summary_ms = now;
+        for (const auto& [h, s] : g_handles) {
+            std::string counts{};
+            for (const auto& [es, count] : s.signatures) {
+                counts += fmt::format(" {}x{}->{}x{}(color {}x{}):{}", es.render_w, es.render_h, es.output_w, es.output_h, es.color_w, es.color_h, count);
+            }
+            spdlog::info("[NGXProbe] handle={:x} created_seq={} render={}x{} out={}x{} calls={} resets={} mismatches={} sigs:{}",
+                h, s.info.created_seq, s.info.width, s.info.height, s.info.out_width, s.info.out_height,
+                s.calls, s.resets, s.mismatches, counts);
+        }
+    }
+}
+
+NVSDK_NGX_Result hk_create(ID3D12GraphicsCommandList* cmd, NVSDK_NGX_Feature feature, NVSDK_NGX_Parameter* params, NVSDK_NGX_Handle** out_handle) {
+    const auto result = g_create_hook.call<NVSDK_NGX_Result>(cmd, feature, params, out_handle);
+    on_create(feature, params, out_handle, result);
+    return result;
+}
+
+NVSDK_NGX_Result hk_release(NVSDK_NGX_Handle* handle) {
+    on_release(handle);
+    return g_release_hook.call<NVSDK_NGX_Result>(handle);
+}
+
+NVSDK_NGX_Result hk_evaluate(ID3D12GraphicsCommandList* cmd, const NVSDK_NGX_Handle* handle, NVSDK_NGX_Parameter* params, void* callback) {
+    on_evaluate(handle, params);
+    return g_evaluate_hook.call<NVSDK_NGX_Result>(cmd, handle, params, callback);
+}
+
+void try_install() {
+    static bool done = false;
+    static ULONGLONG last_attempt_ms = 0;
+    if (done) {
+        return;
+    }
+    if (!is_stalker2_executable_cached()) {
+        done = true;
+        return;
+    }
+    if (NVSDK_NGX_D3D12_EvaluateFeature_Hook) {
+        done = true;
+        spdlog::info("[NGXProbe] AFW owns the NGX hooks (session started in AFW); probe not installed");
+        return;
+    }
+
+    const auto now = GetTickCount64();
+    if (now - last_attempt_ms < 2000) {
+        return;
+    }
+    last_attempt_ms = now;
+
+    // Only observe an NGX module the game already loaded; never load one.
+    auto ngx = GetModuleHandleA("_nvngx.dll");
+    if (ngx == nullptr) {
+        ngx = GetModuleHandleA("nvngx.dll");
+    }
+    const auto create = ngx != nullptr ? GetProcAddress(ngx, "NVSDK_NGX_D3D12_CreateFeature") : nullptr;
+    const auto release = ngx != nullptr ? GetProcAddress(ngx, "NVSDK_NGX_D3D12_ReleaseFeature") : nullptr;
+    const auto evaluate = ngx != nullptr ? GetProcAddress(ngx, "NVSDK_NGX_D3D12_EvaluateFeature") : nullptr;
+    if (create == nullptr || release == nullptr || evaluate == nullptr) {
+        return;
+    }
+
+    done = true;
+    auto c = safetyhook::InlineHook::create(reinterpret_cast<void*>(create), reinterpret_cast<void*>(hk_create));
+    auto r = safetyhook::InlineHook::create(reinterpret_cast<void*>(release), reinterpret_cast<void*>(hk_release));
+    auto e = safetyhook::InlineHook::create(reinterpret_cast<void*>(evaluate), reinterpret_cast<void*>(hk_evaluate));
+    if (c) { g_create_hook = std::move(c.value()); }
+    if (r) { g_release_hook = std::move(r.value()); }
+    if (e) { g_evaluate_hook = std::move(e.value()); }
+    spdlog::info("[NGXProbe] Hooked NGX create={} release={} evaluate={} (features created before this point are logged as known=false)",
+        (bool)g_create_hook, (bool)g_release_hook, (bool)g_evaluate_hook);
+}
+} // namespace ngx_probe
+
 //decltype(&ID3D12GraphicsCommandList::ResourceBarrier) ptrResourceBarrier; // 26
 static SafetyHookInline ResourceBarrier_Hook{};
 void WINAPI hk_ID3D12GraphicsCommandList_ResourceBarrier(ID3D12GraphicsCommandList* This, UINT NumBarriers, const D3D12_RESOURCE_BARRIER* pBarriers) {
@@ -8910,6 +9139,7 @@ void VR::update_camera_data(int frame_count) {
 
 void VR::on_present() {
     ZoneScopedN(__FUNCTION__);
+    ngx_probe::try_install();
 
     static bool btn1 = false;
     if (GetAsyncKeyState(VK_NUMPAD1) < 0 && btn1 == false) {
