@@ -930,79 +930,6 @@ std::string format_rect(const Rect& r) {
     return fmt::format("[{},{}->{},{}]", r.min_x, r.min_y, r.max_x, r.max_y);
 }
 
-// Field tracker: a 4-byte field that stayed constant for 60+ calls and then changes is
-// logged (old -> new, as int and float) with the frame number, and counted per offset.
-// Bursts of quarter-size frames should line up with a stable view field flipping.
-struct FieldTracker {
-    std::vector<uint32_t> last{};
-    std::vector<uint16_t> stable{};
-    std::unordered_map<uint32_t, uint32_t> departures{};
-    uint32_t logged{};
-    bool primed{};
-};
-std::array<FieldTracker, 4> g_field_trackers{}; // [eye * 2 + 0] = FViewInfo, [eye * 2 + 1] = family
-std::array<const char*, 4> g_field_labels{"LEFT view", "LEFT family", "RIGHT view", "RIGHT family"};
-std::chrono::steady_clock::time_point g_last_field_summary{};
-
-void track_fields(size_t index, const char* label, uintptr_t base, size_t size, uint32_t frame) {
-    if (base == 0 || !is_readable_process_range(base, size)) {
-        return;
-    }
-    auto& tracker = g_field_trackers[index];
-    const auto count = size / sizeof(uint32_t);
-    if (tracker.last.size() != count) {
-        tracker.last.assign(count, 0);
-        tracker.stable.assign(count, 0);
-        tracker.primed = false;
-    }
-    const auto* words = reinterpret_cast<const uint32_t*>(base);
-    for (size_t i = 0; i < count; ++i) {
-        const auto value = words[i];
-        if (!tracker.primed) {
-            tracker.last[i] = value;
-            continue;
-        }
-        if (value == tracker.last[i]) {
-            if (tracker.stable[i] < 60000) {
-                ++tracker.stable[i];
-            }
-            continue;
-        }
-        if (tracker.stable[i] >= 60) {
-            const auto offset = static_cast<uint32_t>(i * sizeof(uint32_t));
-            const auto departures = ++tracker.departures[offset];
-            if (tracker.logged < 400 && departures <= 6) {
-                ++tracker.logged;
-                float old_float{}, new_float{};
-                std::memcpy(&old_float, &tracker.last[i], sizeof(old_float));
-                std::memcpy(&new_float, &value, sizeof(new_float));
-                SPDLOG_INFO("[Stalker2][ViewDiff] {} +0x{:x}: {} -> {} (float {:g} -> {:g}) stable_for={} frame={} departure#{}",
-                    label, offset, static_cast<int32_t>(tracker.last[i]), static_cast<int32_t>(value),
-                    old_float, new_float, tracker.stable[i], frame, departures);
-            }
-        }
-        tracker.stable[i] = 0;
-        tracker.last[i] = value;
-    }
-    tracker.primed = true;
-
-    const auto now = std::chrono::steady_clock::now();
-    if (now - g_last_field_summary >= std::chrono::seconds(30)) {
-        g_last_field_summary = now;
-        for (size_t t = 0; t < g_field_trackers.size(); ++t) {
-            std::vector<std::pair<uint32_t, uint32_t>> items(g_field_trackers[t].departures.begin(), g_field_trackers[t].departures.end());
-            std::sort(items.begin(), items.end(), [](const auto& a, const auto& b) { return a.second > b.second; });
-            std::string text{};
-            for (size_t k = 0; k < std::min<size_t>(20, items.size()); ++k) {
-                const auto word = items[k].first / sizeof(uint32_t);
-                const auto current = word < g_field_trackers[t].last.size() ? g_field_trackers[t].last[word] : 0u;
-                text += fmt::format(" +0x{:x}:{}(now {})", items[k].first, items[k].second, static_cast<int32_t>(current));
-            }
-            SPDLOG_INFO("[Stalker2][ViewDiff] {} top departures:{}", g_field_labels[t], text);
-        }
-    }
-}
-
 void record(void* outputs, void* view, void* inputs) {
         if (view == nullptr || inputs == nullptr || outputs == nullptr) {
             return;
@@ -1029,8 +956,6 @@ void record(void* outputs, void* view, void* inputs) {
         signature.out_name = texture_name(*reinterpret_cast<const uintptr_t*>(out + 0x00));
 
         std::scoped_lock lock{g_mutex};
-        track_fields(static_cast<size_t>(eye) * 2 + 0, eye == 1 ? "RIGHT view" : "LEFT view", reinterpret_cast<uintptr_t>(view), 0x4000, frame);
-        track_fields(static_cast<size_t>(eye) * 2 + 1, eye == 1 ? "RIGHT family" : "LEFT family", family_address, 0x200, frame);
         auto& stats = g_eyes[eye];
         ++stats.calls;
         if (stats.last_frame == frame && frame != 0) {
