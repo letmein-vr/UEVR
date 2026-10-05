@@ -95,6 +95,9 @@ private:
     // And the function that calls it is also a virtual function (APlayerController::UpdateRotation)
     static void* process_view_rotation_analyzer(void*, size_t, size_t, size_t, size_t, size_t);
     static void process_view_rotation(sdk::APlayerCameraManager* pcm, float delta_time, Rotator<float>* rot, Rotator<float>* delta_rot);
+    // Applies the analyzer's verdict (swap to process_view_rotation, or drop a rejected candidate).
+    // Must only run at a safe point outside any hooked call (engine tick), never from inside a detour.
+    void update_process_view_rotation_hook();
 
     // UHeadMountedDisplayFunctionLibrary
     static void* get_orientation_and_position_native(void*, void*, void*, void*);
@@ -160,6 +163,18 @@ private:
     uintptr_t m_addr_of_process_view_rotation_ptr{};
     //std::unique_ptr<PointerHook> m_process_view_rotation_hook{};
     safetyhook::InlineHook m_process_view_rotation_hook{};
+
+    // The analyzer detour only records a verdict here; m_process_view_rotation_hook is only
+    // destroyed/re-created by update_process_view_rotation_hook() at the engine tick.
+    enum class ProcessViewRotationHookState : uint8_t {
+        NONE,      // no hook installed
+        ANALYZING, // analyzer installed, waiting for the first call
+        VERIFIED,  // candidate accepted, swap to process_view_rotation pending
+        REJECTED,  // candidate rejected, removal pending
+        INSTALLED, // process_view_rotation installed
+    };
+    std::atomic<ProcessViewRotationHookState> m_process_view_rotation_hook_state{ProcessViewRotationHookState::NONE};
+    uintptr_t m_process_view_rotation_target{};
     safetyhook::MidHook m_daysgone_weapon_aim_trace_hook{};
     std::atomic<void*> m_daysgone_active_pawn{};
     std::atomic<void*> m_daysgone_active_controller{};

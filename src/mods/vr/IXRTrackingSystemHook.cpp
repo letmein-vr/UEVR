@@ -1925,6 +1925,9 @@ void IXRTrackingSystemHook::daysgone_weapon_aim_trace(safetyhook::Context& ctx) 
 }
 
 void IXRTrackingSystemHook::on_pre_engine_tick(sdk::UGameEngine* engine, float delta) {
+    // Safe point: the game thread is not inside the hooked ProcessViewRotation candidate here.
+    update_process_view_rotation_hook();
+
     auto& vr = VR::get();
     const auto direct_aim_compat_requested = is_direct_aim_compatibility_requested();
     const auto direct_aim_compat_active = is_direct_aim_compatibility_active();
@@ -2643,11 +2646,14 @@ bool IXRTrackingSystemHook::analyze_head_tracking_allowed(uintptr_t return_addre
         // that checks whether the arguments match up with what we expect. If they do, we hook it.
         m_addr_of_process_view_rotation_ptr = *func_ptr;
         //g_hook->m_process_view_rotation_hook = std::make_unique<PointerHook>((void**)*func_ptr, (void*)&process_view_rotation_analyzer);
+        g_hook->m_process_view_rotation_target = it->second;
+        g_hook->m_process_view_rotation_hook_state = ProcessViewRotationHookState::ANALYZING;
         g_hook->m_process_view_rotation_hook = safetyhook::create_inline((void*)it->second, (void*)&process_view_rotation_analyzer);
 
         if (!g_hook->m_process_view_rotation_hook) {
             SPDLOG_ERROR("Failed to hook ProcessViewRotation");
             func.process_view_rotation_analysis_failed = true;
+            g_hook->m_process_view_rotation_hook_state = ProcessViewRotationHookState::NONE;
             g_hook->m_attempted_hook_view_rotation = false;
             return true;
         }
@@ -3599,15 +3605,17 @@ bool IXRTrackingSystemHook::update_player_camera(sdk::IXRCamera*, Quat<float>* r
 }
 
 void* IXRTrackingSystemHook::process_view_rotation_analyzer(void* a1, size_t a2, size_t a3, size_t a4, size_t a5, size_t a6) {
+    // Always forward through the live trampoline first. This detour must never reset or
+    // re-create m_process_view_rotation_hook: doing that from inside the hooked call frees the
+    // trampoline while it can still be executing (DEP fault in the safetyhook stub page).
+    const auto result = g_hook->m_process_view_rotation_hook.call<void*>(a1, a2, a3, a4, a5, a6);
+
     SPDLOG_INFO_ONCE("process_view_rotation_analyzer {:x}", (uintptr_t)_ReturnAddress());
 
-    std::scoped_lock _{detail::return_address_to_functions_mutex};
-
-    auto call_orig = [&]() {
-        return g_hook->m_process_view_rotation_hook.call<void*>(a1, a2, a3, a4, a5, a6);
-    };
-
-    const auto result = call_orig();
+    if (g_hook->m_process_view_rotation_hook_state.load() != ProcessViewRotationHookState::ANALYZING) {
+        // Verdict already recorded, update_process_view_rotation_hook() applies it at the next engine tick.
+        return result;
+    }
 
     // Not the exact stack pointer but at least some memory pointing to the stack
     // We need this to check whether the arguments reside on the stack.
@@ -3615,23 +3623,50 @@ void* IXRTrackingSystemHook::process_view_rotation_analyzer(void* a1, size_t a2,
     const auto stack_pointer = (intptr_t)_AddressOfReturnAddress();
 
     // Check if a3 and a4 are on the stack, and are not equal to eachother
-    if (std::abs((intptr_t)a3 - stack_pointer) > 0x1000 || std::abs((intptr_t)a4 - stack_pointer) > 0x1000 || a3 == a4) {
-        SPDLOG_ERROR("Function we hooked for ProcessViewRotation is not the correct one. Analyzing next function.");
+    const auto is_correct = !(std::abs((intptr_t)a3 - stack_pointer) > 0x1000 || std::abs((intptr_t)a4 - stack_pointer) > 0x1000 || a3 == a4);
+    auto expected = ProcessViewRotationHookState::ANALYZING;
+    const auto verdict = is_correct ? ProcessViewRotationHookState::VERIFIED : ProcessViewRotationHookState::REJECTED;
 
-        const auto function_addr = g_hook->m_process_view_rotation_hook.target_address();
-        detail::functions[function_addr].process_view_rotation_analysis_failed = true;
+    if (!g_hook->m_process_view_rotation_hook_state.compare_exchange_strong(expected, verdict)) {
+        return result;
+    }
 
-        g_hook->m_process_view_rotation_hook.reset();
-        g_hook->m_attempted_hook_view_rotation = false;
+    if (is_correct) {
+        SPDLOG_INFO("Found correct function for ProcessViewRotation. Hooking it at next engine tick.");
     } else {
-        SPDLOG_INFO("Found correct function for ProcessViewRotation. Hooking it.");
-        const auto target = g_hook->m_process_view_rotation_hook.target();
-        g_hook->m_process_view_rotation_hook.reset();
-        //g_hook->m_process_view_rotation_hook = std::make_unique<PointerHook>((void**)g_hook->m_addr_of_process_view_rotation_ptr, &IXRTrackingSystemHook::process_view_rotation);
-        g_hook->m_process_view_rotation_hook = safetyhook::create_inline(target, &IXRTrackingSystemHook::process_view_rotation);
+        SPDLOG_ERROR("Function we hooked for ProcessViewRotation is not the correct one. Analyzing next function.");
     }
 
     return result;
+}
+
+void IXRTrackingSystemHook::update_process_view_rotation_hook() {
+    const auto state = m_process_view_rotation_hook_state.load();
+
+    if (state == ProcessViewRotationHookState::REJECTED) {
+        {
+            std::scoped_lock _{detail::return_address_to_functions_mutex};
+            detail::functions[m_process_view_rotation_target].process_view_rotation_analysis_failed = true;
+        }
+
+        m_process_view_rotation_hook.reset();
+        m_process_view_rotation_hook_state = ProcessViewRotationHookState::NONE;
+        m_attempted_hook_view_rotation = false;
+        SPDLOG_INFO("Removed rejected ProcessViewRotation candidate 0x{:x}", m_process_view_rotation_target);
+    } else if (state == ProcessViewRotationHookState::VERIFIED) {
+        // The old hook must be gone before re-hooking the same target.
+        m_process_view_rotation_hook.reset();
+        //m_process_view_rotation_hook = std::make_unique<PointerHook>((void**)m_addr_of_process_view_rotation_ptr, &IXRTrackingSystemHook::process_view_rotation);
+        m_process_view_rotation_hook = safetyhook::create_inline((void*)m_process_view_rotation_target, &IXRTrackingSystemHook::process_view_rotation);
+
+        if (m_process_view_rotation_hook) {
+            m_process_view_rotation_hook_state = ProcessViewRotationHookState::INSTALLED;
+            SPDLOG_INFO("Hooked verified ProcessViewRotation 0x{:x}", m_process_view_rotation_target);
+        } else {
+            m_process_view_rotation_hook_state = ProcessViewRotationHookState::NONE;
+            SPDLOG_ERROR("Failed to hook verified ProcessViewRotation 0x{:x}", m_process_view_rotation_target);
+        }
+    }
 }
 
 void IXRTrackingSystemHook::process_view_rotation(
