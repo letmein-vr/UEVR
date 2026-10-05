@@ -793,6 +793,10 @@ public:
         return m_native_stereo_fix_same_pass->value();
     }
 
+    bool is_native_stereo_fix_ue55_linked_family_enabled() const {
+        return m_native_stereo_fix_ue55_linked_family->value();
+    }
+
     bool is_native_stereo_fix_preserve_secondary_pass_enabled() const {
         return m_native_stereo_fix_preserve_secondary_pass->value();
     }
@@ -1703,6 +1707,7 @@ private:
     const ModToggle::Ptr m_native_stereo_fix{ ModToggle::create(generate_name("NativeStereoFix"), false) };
     const ModToggle::Ptr m_native_stereo_fix_same_pass{ ModToggle::create(generate_name("NativeStereoFixSamePass"), true) };
     const ModToggle::Ptr m_native_stereo_fix_preserve_secondary_pass{ ModToggle::create(generate_name("NativeStereoFixPreserveSecondaryPass"), true) };
+    const ModToggle::Ptr m_native_stereo_fix_ue55_linked_family{ ModToggle::create(generate_name("NativeStereoFixUE55LinkedFamily"), true) };
     const ModToggle::Ptr m_native_stereo_fix_texture_array_submit{ ModToggle::create(generate_name("NativeStereoFixTextureArraySubmit"), false) };
     const ModToggle::Ptr m_native_stereo_fix_async_openxr_wait{ ModToggle::create(generate_name("NativeStereoFixAsyncOpenXRWait"), false) };
 
@@ -2020,6 +2025,7 @@ public:
             *m_native_stereo_fix,
             *m_native_stereo_fix_same_pass,
             *m_native_stereo_fix_preserve_secondary_pass,
+            *m_native_stereo_fix_ue55_linked_family,
             *m_native_stereo_fix_texture_array_submit,
             *m_native_stereo_fix_async_openxr_wait,
             *m_splitscreen_compatibility_mode,

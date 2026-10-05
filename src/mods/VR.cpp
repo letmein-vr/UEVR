@@ -9568,6 +9568,13 @@ void VR::on_draw_sidebar_entry(std::string_view name) {
                 m_native_stereo_fix_same_pass->draw("Use Same Stereo Pass");
             }
             m_native_stereo_fix_preserve_secondary_pass->draw("Preserve Secondary Pass on UE5.5+");
+            if (stalker2_native_fix_requires_same_pass_cached()) {
+                m_native_stereo_fix_ue55_linked_family->draw("Stalker 2: Linked Right-Eye Family");
+                if (ImGui::IsItemHovered()) {
+                    ImGui::SetTooltip("Renders both eyes in one renderer transaction (left family + additional right family) "
+                                      "instead of re-rendering the same family. Fix candidate for the quarter-size right eye.");
+                }
+            }
             if (uevr::nascar::is_target()) {
                 ImGui::EndDisabled();
                 ImGui::TextWrapped("NASCAR keeps the original eye indices/history and temporarily gives the right singleton a primary pass only while creating its renderer. These generic pass options are not used.");
