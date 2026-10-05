@@ -9595,6 +9595,11 @@ void VR::on_draw_sidebar_entry(std::string_view name) {
             }
             m_native_stereo_fix_preserve_secondary_pass->draw("Preserve Secondary Pass on UE5.5+");
             if (stalker2_native_fix_requires_same_pass_cached()) {
+                m_native_stereo_fix_ue55_linked_family->draw("Stalker 2: Linked Right-Eye Family");
+                if (ImGui::IsItemHovered()) {
+                    ImGui::SetTooltip("Renders both eyes in one renderer transaction (left family + additional right family) "
+                                      "instead of re-rendering the same family.");
+                }
                 m_native_stereo_fix_stalker2_grow_only_scene_textures->draw("Stalker 2: Grow-Only Scene Textures");
                 if (ImGui::IsItemHovered()) {
                     ImGui::SetTooltip("Forces r.SceneRenderTargetResizeMethod 2 (grow only). Fixes the intermittent quarter-size "

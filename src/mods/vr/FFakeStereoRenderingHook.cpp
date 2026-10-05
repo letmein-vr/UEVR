@@ -852,6 +852,205 @@ private:
     bool m_constructed{};
 };
 
+// Stalker 2 (UE5.5) right-eye family for one linked BeginRenderingViewFamilies
+// call. The legacy UE5.5 path renders the SAME family twice (views=[left], then
+// views=[right] into the capture target); per-family/per-frame renderer state
+// then leaks into the second render (quarter-size right eye with DLSS/TAAU).
+// UE5.5 has no proven out-of-line FSceneViewFamily copy constructor, so this is
+// a shallow byte copy that is never destructed: the renderer copies the family
+// by value and forks its screen-percentage/upscaler interfaces, so the borrowed
+// interface pointers and TSharedRef extension array stay owned by the source.
+// Views/AllViews get clone-local storage so nothing can grow the source arrays.
+class UE55LinkedRightFamily {
+public:
+    struct RawArray {
+        void* data;
+        int32_t count;
+        int32_t capacity;
+    };
+    static_assert(sizeof(RawArray) == 0x10);
+
+    bool initialize(
+        sdk::FSceneViewFamily* source,
+        sdk::FSceneView* right_view,
+        uint32_t frame_number_offset,
+        const char*& failure_reason)
+    {
+        failure_reason = nullptr;
+        m_object = nullptr;
+
+        const auto layout = sdk::FSceneViewFamily::get_layout_snapshot();
+        if (source == nullptr || right_view == nullptr || layout == nullptr ||
+            !layout->views.has_value() || !layout->render_target.has_value() ||
+            !layout->scene_interface.has_value())
+        {
+            failure_reason = "family layout is unresolved";
+            return false;
+        }
+
+        const auto views_offset = *layout->views;
+        const auto all_views_offset = views_offset + static_cast<uint32_t>(sizeof(RawArray));
+        if (frame_number_offset != stalker2_frame_number_offset || views_offset != 0x08 ||
+            *layout->render_target != 0x30 || *layout->scene_interface != 0x40)
+        {
+            failure_reason = "family field offsets do not match the Stalker 2 UE5.5 constructor layout";
+            return false;
+        }
+
+        const auto source_address = reinterpret_cast<uintptr_t>(source);
+        if (!is_readable_process_range(source_address, copy_size)) {
+            failure_reason = "source family is unreadable";
+            return false;
+        }
+
+        const auto* const source_all_views =
+            reinterpret_cast<const RawArray*>(source_address + all_views_offset);
+        if (source_all_views->count != 0) {
+            failure_reason = "source family AllViews is not empty";
+            return false;
+        }
+
+        // FSceneViewFamily(ConstructionValues) at RVA 0x51C9A writes
+        // bAdditionalViewFamily/bRealtimeUpdate/bDeferClear/bResolveScene to
+        // +0xC8..+0xCB from the CVS bitfield, then plain bools through
+        // bIsFirstViewInMultipleViewFamily (+0xD1, read by BeginRenderingViewFamilies).
+        const auto* const flags = reinterpret_cast<const uint8_t*>(source_address + additional_offset);
+        if (flags[0] != 0 || flags[1] != 1) {
+            failure_reason = "bAdditionalViewFamily/bRealtimeUpdate did not validate";
+            return false;
+        }
+        for (size_t index = 2; index < flag_span; ++index) {
+            if (flags[index] > 1) {
+                failure_reason = "family flag bytes after bRealtimeUpdate are not bools";
+                return false;
+            }
+        }
+
+        // Inline-allocated per-family array rebuilt by BeginRenderingViewFamilies
+        // for every family (element 0x18, inline capacity 2). A shared heap
+        // buffer would let the engine write into, or reallocate, the source's.
+        RawArray source_inline_array{};
+        std::memcpy(&source_inline_array, reinterpret_cast<const void*>(source_address + inline_array_data_offset), sizeof(source_inline_array));
+        if (source_inline_array.count < 0 || source_inline_array.capacity < inline_array_inline_capacity ||
+            source_inline_array.count > source_inline_array.capacity || source_inline_array.capacity > 256 ||
+            (source_inline_array.data == nullptr && source_inline_array.capacity != inline_array_inline_capacity))
+        {
+            failure_reason = "per-family inline array did not validate";
+            return false;
+        }
+
+        std::memcpy(m_storage.data(), source, copy_size);
+        auto* const object = reinterpret_cast<uint8_t*>(m_storage.data());
+
+        if (source_inline_array.data != nullptr) {
+            const auto needed = static_cast<size_t>(source_inline_array.capacity);
+            if (m_inline_array_heap == nullptr || m_inline_array_heap_capacity < needed) {
+                auto* const allocator = sdk::FMalloc::get();
+                if (allocator == nullptr) {
+                    failure_reason = "engine allocator is unavailable";
+                    return false;
+                }
+                if (m_inline_array_heap != nullptr) {
+                    allocator->free(m_inline_array_heap);
+                }
+                m_inline_array_heap = allocator->malloc(needed * inline_array_element_size, 16);
+                m_inline_array_heap_capacity = m_inline_array_heap != nullptr ? needed : 0;
+                if (m_inline_array_heap == nullptr) {
+                    failure_reason = "engine allocation for the per-family array failed";
+                    return false;
+                }
+            }
+
+            std::memcpy(m_inline_array_heap, source_inline_array.data,
+                static_cast<size_t>(source_inline_array.count) * inline_array_element_size);
+            const RawArray clone_inline_array{
+                m_inline_array_heap,
+                source_inline_array.count,
+                static_cast<int32_t>(m_inline_array_heap_capacity),
+            };
+            std::memcpy(object + inline_array_data_offset, &clone_inline_array, sizeof(clone_inline_array));
+        }
+        m_expected_inline_array_data = *reinterpret_cast<void**>(object + inline_array_data_offset);
+
+        m_views[0] = right_view;
+        const RawArray views{m_views.data(), 1, 1};
+        const RawArray empty{};
+        std::memcpy(object + views_offset, &views, sizeof(views));
+        std::memcpy(object + all_views_offset, &empty, sizeof(empty));
+        object[additional_offset] = 1;
+
+        m_views_offset = views_offset;
+        m_object = reinterpret_cast<sdk::FSceneViewFamily*>(object);
+
+        SPDLOG_INFO_ONCE(
+            "[Stalker2][UE5.5][NativeStereoFix][Linked] Clone flags(+0xC8..+0xD1)={:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} "
+            "inline_array data={:x} count={} max={} frame_number={}",
+            flags[0], flags[1], flags[2], flags[3], flags[4], flags[5], flags[6], flags[7], flags[8], flags[9],
+            reinterpret_cast<uintptr_t>(source_inline_array.data), source_inline_array.count, source_inline_array.capacity,
+            *reinterpret_cast<const uint32_t*>(source_address + frame_number_offset));
+        return true;
+    }
+
+    sdk::FSceneViewFamily* get() const {
+        return m_object;
+    }
+
+    // The renderer must not have grown or replaced the clone-local Views array.
+    bool views_intact() const {
+        if (m_object == nullptr) {
+            return false;
+        }
+
+        RawArray views{};
+        std::memcpy(&views, reinterpret_cast<const uint8_t*>(m_object) + m_views_offset, sizeof(views));
+        return views.data == m_views.data() && views.count == 1;
+    }
+
+    // If the engine grew the per-family array it reallocated through FMalloc;
+    // adopt the new heap block (never the clone's inline storage) so it is reused.
+    void adopt_inline_array_after_render() {
+        if (m_object == nullptr) {
+            return;
+        }
+
+        RawArray current{};
+        std::memcpy(&current, reinterpret_cast<const uint8_t*>(m_object) + inline_array_data_offset, sizeof(current));
+        if (current.data == m_expected_inline_array_data) {
+            return;
+        }
+
+        SPDLOG_INFO_EVERY_N_SEC(
+            10,
+            "[Stalker2][UE5.5][NativeStereoFix][Linked] Per-family array reallocated by the engine data={:x} max={}",
+            reinterpret_cast<uintptr_t>(current.data),
+            current.capacity);
+        if (current.data != nullptr) {
+            m_inline_array_heap = current.data;
+            m_inline_array_heap_capacity = static_cast<size_t>(std::max(current.capacity, 0));
+        } else {
+            m_inline_array_heap = nullptr;
+            m_inline_array_heap_capacity = 0;
+        }
+    }
+
+private:
+    static constexpr size_t copy_size = 0x400;
+    static constexpr uint32_t stalker2_frame_number_offset = 0xAC;
+    static constexpr size_t additional_offset = 0xC8;
+    static constexpr size_t flag_span = 10; // +0xC8..+0xD1
+    static constexpr size_t inline_array_data_offset = 0x168;
+    static constexpr size_t inline_array_element_size = 0x18;
+    static constexpr int32_t inline_array_inline_capacity = 2;
+
+    alignas(16) std::array<uint8_t, copy_size> m_storage{};
+    std::array<sdk::FSceneView*, 1> m_views{};
+    uint32_t m_views_offset{};
+    sdk::FSceneViewFamily* m_object{};
+    void* m_inline_array_heap{};
+    size_t m_inline_array_heap_capacity{};
+    void* m_expected_inline_array_data{};
+};
+
 // DIAGNOSTIC (Stalker 2 quarter-size right eye): passive hook on the NVIDIA DLSS
 // plugin's FDLSSSceneViewFamilyUpscaler::AddPasses (vtable RVA 0x8B06760 slot 2,
 // function RVA 0x6241342). Logs, per eye, the rects/texture names going in and
@@ -25118,6 +25317,117 @@ void FFakeStereoRenderingHook::begin_render_viewfamily_real(void* render_module,
         stalker2_dlss_probe::g_right_target.store(reinterpret_cast<uintptr_t>(rtfrt), std::memory_order_release);
         stalker2_dlss_probe::g_frame_number_offset.store(SceneViewExtensionAnalyzer::frame_count_offset, std::memory_order_release);
         stalker2_dlss_probe::install_once();
+    }
+
+    // Stalker 2 UE5.5: render both eyes in ONE renderer transaction (left family +
+    // an additional right family targeting the capture RT) instead of rendering
+    // the same family twice. Any precondition miss falls through to the legacy path.
+    if (uses_tarrayview &&
+        vr->is_native_stereo_fix_ue55_linked_family_enabled() &&
+        stalker2_uses_validated_ue55_native_fix_capture_layout())
+    {
+        thread_local UE55LinkedRightFamily right_family_clone{};
+        const char* clone_failure_reason{};
+        const bool clone_ready = right_family_clone.initialize(
+            view_family,
+            native_right_view,
+            SceneViewExtensionAnalyzer::frame_count_offset,
+            clone_failure_reason);
+        auto* const right_family = clone_ready ? right_family_clone.get() : nullptr;
+
+        std::array<sdk::FSceneViewFamily*, max_sane_view_families + 1> linked_family_storage{};
+        size_t linked_family_count{};
+        size_t selected_family_occurrences{};
+        if (right_family != nullptr) {
+            for (const auto family : view_families) {
+                if (linked_family_count + 2 > linked_family_storage.size()) {
+                    selected_family_occurrences = 0;
+                    break;
+                }
+                linked_family_storage[linked_family_count++] = family;
+                if (family == view_family) {
+                    linked_family_storage[linked_family_count++] = right_family;
+                    ++selected_family_occurrences;
+                }
+            }
+        }
+
+        // Stalker 2 forces Same Stereo Pass, so the right view was already
+        // constructed as PRIMARY and can lead its singleton family as-is.
+        if (right_family != nullptr && selected_family_occurrences == 1 &&
+            linked_family_count == view_families.size() + 1 &&
+            try_set_ue57_scene_view_family(native_right_view, view_family, right_family))
+        {
+            right_family->set_render_target(rtfrt);
+
+            views.data[0] = native_left_view;
+            views.data[1] = native_right_view;
+            views.count = 1;
+
+            TArrayViewViewFamily linked_family_array{
+                linked_family_storage.data(),
+                static_cast<uint32_t>(linked_family_count),
+            };
+
+            SPDLOG_INFO_ONCE(
+                "[Stalker2][UE5.5][NativeStereoFix][Linked] Rendering left family + additional right family "
+                "in one renderer transaction (families={})",
+                linked_family_count);
+            g_hook->m_render_module_begin_render_viewfamily_hook.unsafe_call<void>(
+                render_module,
+                canvas,
+                reinterpret_cast<sdk::FSceneViewFamily*>(&linked_family_array));
+
+            const bool backlink_restored =
+                native_right_view->get_view_family() == view_family ||
+                try_set_ue57_scene_view_family(native_right_view, right_family, view_family);
+            const bool clone_views_intact = right_family_clone.views_intact();
+            right_family_clone.adopt_inline_array_after_render();
+
+            views.data[0] = original_first;
+            views.data[1] = original_second;
+            views.count = prev_count;
+            view_family->set_render_target(original_target);
+
+            if (!backlink_restored || !clone_views_intact) {
+                g_hook->invalidate_native_stereo_frame_packet(
+                    NativeStereoFixState::FailedClosed,
+                    "linked right family was not restored after rendering");
+                SPDLOG_ERROR_EVERY_N_SEC(
+                    2,
+                    "[Stalker2][UE5.5][NativeStereoFix][Linked] Post-render validation failed backlink={} clone_views={}",
+                    backlink_restored,
+                    clone_views_intact);
+                return;
+            }
+
+            if (g_hook->uses_frame_keyed_native_packets()) {
+                const auto left_frame = read_native_family_frame_number(view_family);
+                const auto right_frame = read_native_family_frame_number(right_family);
+                if (left_frame && right_frame && *left_frame == *right_frame) {
+                    keyed_family_frames = std::make_pair(*left_frame, *right_frame);
+                } else {
+                    SPDLOG_WARNING_EVERY_N_SEC(
+                        2,
+                        "[Stalker2][UE5.5][NativeStereoFix][Linked] Eye FrameNumbers differ (left={} right={}); publishing unkeyed",
+                        left_frame.value_or(0),
+                        right_frame.value_or(0));
+                }
+            }
+
+            publish_native_packet();
+            return;
+        }
+
+        if (native_right_view->get_view_family() != view_family) {
+            try_set_ue57_scene_view_family(native_right_view, right_family, view_family);
+        }
+        SPDLOG_WARNING_EVERY_N_SEC(
+            10,
+            "[Stalker2][UE5.5][NativeStereoFix][Linked] Using the legacy two-render path: {}",
+            clone_failure_reason != nullptr
+                ? clone_failure_reason
+                : "family list or right view Family backlink could not be linked");
     }
 
     const auto use_daysgone_same_frame_render =
