@@ -32,6 +32,9 @@
 
 #include "D3D12Component.hpp"
 
+// DIAGNOSTIC (VR.cpp): Stalker 2 quarter-size right-eye detector, capture point.
+void quarter_monitor_on_present_capture(ID3D12CommandQueue* queue, ID3D12Resource* capture, uint32_t frame);
+
 //#define AFR_DEPTH_TEMP_DISABLED
 
 constexpr auto ENGINE_SRC_DEPTH = D3D12_RESOURCE_STATE_DEPTH_READ | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
@@ -4514,6 +4517,15 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
                         m_openxr.copy((uint32_t)runtimes::OpenXR::SwapchainIndex::DOUBLE_WIDE, backbuffer.Get(), scene_source_state, nullptr);
                     } else {
                         m_openxr.copy((uint32_t)runtimes::OpenXR::SwapchainIndex::DOUBLE_WIDE, nullptr, pre_render, std::nullopt, D3D12_RESOURCE_STATE_RENDER_TARGET, nullptr);
+                    }
+
+                    // DIAGNOSTIC: per-frame quarter-size detector on the right-eye capture (VR.cpp).
+                    if (vr->is_native_stereo_fix_enabled() && native_stereo_packet != nullptr && m_scene_capture_tex.texture.Get() != nullptr) {
+                        const auto& d3d12_hook = g_framework->get_d3d12_hook();
+                        quarter_monitor_on_present_capture(
+                            d3d12_hook != nullptr ? d3d12_hook->get_command_queue() : nullptr,
+                            m_scene_capture_tex.texture.Get(),
+                            static_cast<uint32_t>(vr->m_frame_count));
                     }
 
                     if (scene_depth_tex != nullptr && !native_stereo_array_submit_active) {
