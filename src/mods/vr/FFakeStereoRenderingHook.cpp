@@ -1051,6 +1051,180 @@ private:
     void* m_expected_inline_array_data{};
 };
 
+// DIAGNOSTIC (Stalker 2 quarter-size right eye): passive hook on the NVIDIA DLSS
+// plugin's FDLSSSceneViewFamilyUpscaler::AddPasses (vtable RVA 0x8B06760 slot 2,
+// function RVA 0x6241342). Logs, per eye, the rects/texture names going in and
+// coming out so a bad frame shows which side of DLSS the quarter comes from.
+namespace stalker2_dlss_probe {
+constexpr uintptr_t ADD_PASSES_RVA = 0x6241342;
+constexpr std::array<uint8_t, 19> ADD_PASSES_PROLOGUE{
+    0x41, 0x57, 0x41, 0x56, 0x41, 0x55, 0x41, 0x54, 0x56, 0x57, 0x55, 0x53,
+    0x48, 0x81, 0xEC, 0xD8, 0x01, 0x00, 0x00,
+};
+
+struct Rect {
+    int32_t min_x, min_y, max_x, max_y;
+    bool operator==(const Rect&) const = default;
+};
+
+struct Signature {
+    Rect output_view_rect{};   // FInputs::OutputViewRect (+0x00)
+    Rect scene_color_rect{};   // FInputs::SceneColor.ViewRect (+0x28)
+    Rect out_rect{};           // FOutputs::FullRes.ViewRect (+0x08)
+    uintptr_t scene_color_name{};
+    uintptr_t out_name{};
+    bool operator==(const Signature&) const = default;
+};
+
+std::atomic_uintptr_t g_right_target{};
+std::atomic_uint32_t g_frame_number_offset{};
+safetyhook::InlineHook g_hook{};
+std::mutex g_mutex{};
+
+struct EyeStats {
+    std::vector<std::pair<Signature, uint64_t>> signatures{};
+    uint64_t calls{};
+    uint32_t last_frame{};
+    uint64_t frames_with_two_calls{};
+};
+std::array<EyeStats, 2> g_eyes{};
+std::chrono::steady_clock::time_point g_last_summary{};
+
+std::string read_name(uintptr_t name_ptr) {
+    if (name_ptr == 0 || !is_readable_process_range(name_ptr, 2)) {
+        return "?";
+    }
+    std::string result{};
+    for (size_t i = 0; i < 48; ++i) {
+        if (!is_readable_process_range(name_ptr + i * 2, 2)) {
+            break;
+        }
+        const auto c = *reinterpret_cast<const wchar_t*>(name_ptr + i * 2);
+        if (c == 0) {
+            return result;
+        }
+        if (c < 0x20 || c > 0x7E) {
+            return "?";
+        }
+        result.push_back(static_cast<char>(c));
+    }
+    return result;
+}
+
+// FRDGResource::Name is the first member (no vtable in UE5.5); fall back to +8.
+uintptr_t texture_name(uintptr_t texture) {
+    if (texture == 0 || !is_readable_process_range(texture, 16)) {
+        return 0;
+    }
+    for (size_t offset : {size_t{0}, size_t{8}}) {
+        const auto candidate = *reinterpret_cast<const uintptr_t*>(texture + offset);
+        if (read_name(candidate) != "?") {
+            return candidate;
+        }
+    }
+    return 0;
+}
+
+std::string format_rect(const Rect& r) {
+    return fmt::format("[{},{}->{},{}]", r.min_x, r.min_y, r.max_x, r.max_y);
+}
+
+void record(void* outputs, void* view, void* inputs) {
+        if (view == nullptr || inputs == nullptr || outputs == nullptr) {
+            return;
+        }
+
+        const auto* const family = reinterpret_cast<sdk::FSceneView*>(view)->get_view_family();
+        const auto family_address = reinterpret_cast<uintptr_t>(family);
+        if (family == nullptr || !is_readable_process_range(family_address, 0x100)) {
+            return;
+        }
+
+        const auto right_target = g_right_target.load(std::memory_order_acquire);
+        const auto eye = right_target != 0 && reinterpret_cast<uintptr_t>(family->get_render_target()) == right_target ? 1 : 0;
+        const auto frame_offset = g_frame_number_offset.load(std::memory_order_acquire);
+        const auto frame = frame_offset != 0 ? *reinterpret_cast<const uint32_t*>(family_address + frame_offset) : 0u;
+
+        const auto in = reinterpret_cast<uintptr_t>(inputs);
+        const auto out = reinterpret_cast<uintptr_t>(outputs);
+        Signature signature{};
+        std::memcpy(&signature.output_view_rect, reinterpret_cast<const void*>(in + 0x00), sizeof(Rect));
+        std::memcpy(&signature.scene_color_rect, reinterpret_cast<const void*>(in + 0x28), sizeof(Rect));
+        std::memcpy(&signature.out_rect, reinterpret_cast<const void*>(out + 0x08), sizeof(Rect));
+        signature.scene_color_name = texture_name(*reinterpret_cast<const uintptr_t*>(in + 0x20));
+        signature.out_name = texture_name(*reinterpret_cast<const uintptr_t*>(out + 0x00));
+
+        std::scoped_lock lock{g_mutex};
+        auto& stats = g_eyes[eye];
+        ++stats.calls;
+        if (stats.last_frame == frame && frame != 0) {
+            ++stats.frames_with_two_calls;
+        }
+        stats.last_frame = frame;
+
+        auto it = std::find_if(stats.signatures.begin(), stats.signatures.end(),
+            [&](const auto& entry) { return entry.first == signature; });
+        if (it == stats.signatures.end()) {
+            if (stats.signatures.size() < 32) {
+                stats.signatures.emplace_back(signature, 1);
+            }
+            SPDLOG_INFO(
+                "[Stalker2][DLSSProbe] NEW {} signature frame={} OutputViewRect={} SceneColor={} '{}' -> FullRes={} '{}'",
+                eye == 1 ? "RIGHT" : "LEFT", frame,
+                format_rect(signature.output_view_rect),
+                format_rect(signature.scene_color_rect), read_name(signature.scene_color_name),
+                format_rect(signature.out_rect), read_name(signature.out_name));
+        } else {
+            ++it->second;
+        }
+
+        const auto now = std::chrono::steady_clock::now();
+        if (now - g_last_summary >= std::chrono::seconds(10)) {
+            g_last_summary = now;
+            for (size_t index = 0; index < g_eyes.size(); ++index) {
+                const auto& eye_stats = g_eyes[index];
+                std::string counts{};
+                for (const auto& [sig, count] : eye_stats.signatures) {
+                    counts += fmt::format(" {}->{}:{}", format_rect(sig.scene_color_rect), format_rect(sig.out_rect), count);
+                }
+                SPDLOG_INFO("[Stalker2][DLSSProbe] {} calls={} repeat-frame calls={} signatures:{}",
+                    index == 1 ? "RIGHT" : "LEFT", eye_stats.calls, eye_stats.frames_with_two_calls, counts);
+            }
+        }
+}
+
+void record_guarded(void* outputs, void* view, void* inputs) {
+    __try {
+        record(outputs, view, inputs);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+    }
+}
+
+void* __fastcall add_passes(void* self, void* outputs, void* graph, void* view, void* inputs) {
+    auto* const result = g_hook.unsafe_call<void*>(self, outputs, graph, view, inputs);
+    record_guarded(outputs, view, inputs);
+    return result;
+}
+
+void install_once() {
+    static std::once_flag once{};
+    std::call_once(once, []() {
+        const auto base = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
+        const auto target = base + ADD_PASSES_RVA;
+        if (!is_readable_process_range(target, ADD_PASSES_PROLOGUE.size()) ||
+            std::memcmp(reinterpret_cast<const void*>(target), ADD_PASSES_PROLOGUE.data(), ADD_PASSES_PROLOGUE.size()) != 0)
+        {
+            SPDLOG_WARN("[Stalker2][DLSSProbe] AddPasses prologue mismatch at {:x}; probe not installed", target);
+            return;
+        }
+
+        g_hook = safetyhook::create_inline(target, reinterpret_cast<uintptr_t>(&add_passes));
+        SPDLOG_INFO("[Stalker2][DLSSProbe] {} FDLSSSceneViewFamilyUpscaler::AddPasses hook at {:x}",
+            g_hook ? "Installed" : "FAILED to install", target);
+    });
+}
+} // namespace stalker2_dlss_probe
+
 std::mutex g_shf_texture_probe_mutex{};
 std::unordered_set<uintptr_t> g_shf_logged_texture_probe_keys{};
 std::unordered_map<uintptr_t, std::chrono::steady_clock::time_point> g_shf_last_texture_probe_by_base{};
@@ -25137,6 +25311,12 @@ void FFakeStereoRenderingHook::begin_render_viewfamily_real(void* render_module,
 
         publish_native_packet();
         return;
+    }
+
+    if (stalker2_uses_validated_ue55_native_fix_capture_layout()) {
+        stalker2_dlss_probe::g_right_target.store(reinterpret_cast<uintptr_t>(rtfrt), std::memory_order_release);
+        stalker2_dlss_probe::g_frame_number_offset.store(SceneViewExtensionAnalyzer::frame_count_offset, std::memory_order_release);
+        stalker2_dlss_probe::install_once();
     }
 
     // Stalker 2 UE5.5: render both eyes in ONE renderer transaction (left family +
