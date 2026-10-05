@@ -201,6 +201,12 @@ NVSDK_NGX_Result hk_NVSDK_NGX_D3D12_EvaluateFeature(
     return result;
 }
 
+namespace barrier_probe {
+extern thread_local bool g_self;
+void note_eval(ID3D12GraphicsCommandList* list, ID3D12Resource* output, ID3D12Resource* input);
+std::string take_frame_events(ID3D12Resource* capture);
+}
+
 // DIAGNOSTIC (Stalker 2 quarter-size right eye, strip before release): per-frame
 // quarter-size detector at two points - (A) the Native Fix right-eye capture texture
 // at Present and (B) every DLSS output texture right after its NGX evaluation. Copies
@@ -493,7 +499,26 @@ struct PairSlot {
     ColumnCopy capture{}, output{}, input{};
     uintptr_t handle{};
     uint32_t frame{};
+    std::string barrier_events{};
 };
+
+// Barrier-sequence histograms for good (capture = DLSS output) and bad (capture = input) frames.
+std::unordered_map<std::string, uint64_t> g_good_barriers{}, g_bad_barriers{};
+ULONGLONG g_last_barrier_summary_ms{};
+
+void log_barrier_histograms() {
+    const auto top = [](const std::unordered_map<std::string, uint64_t>& map, size_t n) {
+        std::vector<std::pair<std::string, uint64_t>> items(map.begin(), map.end());
+        std::sort(items.begin(), items.end(), [](const auto& a, const auto& b) { return a.second > b.second; });
+        std::string result{};
+        for (size_t i = 0; i < std::min(n, items.size()); ++i) {
+            result += fmt::format("\n    {}x:{}", items[i].second, items[i].first);
+        }
+        return result;
+    };
+    SPDLOG_INFO("[BarrierProbe] GOOD-frame sequences ({} distinct):{}", g_good_barriers.size(), top(g_good_barriers, 4));
+    SPDLOG_INFO("[BarrierProbe] BAD-frame sequences ({} distinct):{}", g_bad_barriers.size(), top(g_bad_barriers, 6));
+}
 
 std::array<PairSlot, 8> g_pairs{};
 uint32_t g_pair_index{};
@@ -636,18 +661,26 @@ void score_pair(PairSlot& slot) {
     }
     if (c_in > c_out + 0.2f) {
         ++g_pair_stats.matches_input;
+        ++g_bad_barriers[slot.barrier_events];
         if (g_pair_stats.logged_input++ < 40 || g_pair_stats.matches_input % 200 == 0) {
-            SPDLOG_INFO("[QuarterMonitor][Pair] CAPTURE MATCHES DLSS INPUT 1:1 #{} frame={} handle={:x} corr_output={:.2f} corr_input={:.2f} rows={}",
-                g_pair_stats.matches_input, slot.frame, slot.handle, c_out, c_in, rows);
+            SPDLOG_INFO("[QuarterMonitor][Pair] CAPTURE MATCHES DLSS INPUT 1:1 #{} frame={} handle={:x} corr_output={:.2f} corr_input={:.2f} rows={} barriers:{}",
+                g_pair_stats.matches_input, slot.frame, slot.handle, c_out, c_in, rows, slot.barrier_events);
         }
     } else if (c_out > c_in + 0.2f) {
         ++g_pair_stats.matches_output;
+        ++g_good_barriers[slot.barrier_events];
         if (g_pair_stats.logged_output++ < 5) {
-            SPDLOG_INFO("[QuarterMonitor][Pair] capture matches DLSS output (baseline) frame={} handle={:x} corr_output={:.2f} corr_input={:.2f} rows={}",
-                slot.frame, slot.handle, c_out, c_in, rows);
+            SPDLOG_INFO("[QuarterMonitor][Pair] capture matches DLSS output (baseline) frame={} handle={:x} corr_output={:.2f} corr_input={:.2f} rows={} barriers:{}",
+                slot.frame, slot.handle, c_out, c_in, rows, slot.barrier_events);
         }
     } else {
         ++g_pair_stats.ambiguous;
+    }
+
+    const auto now = GetTickCount64();
+    if (now - g_last_barrier_summary_ms >= 30000 && !g_bad_barriers.empty()) {
+        g_last_barrier_summary_ms = now;
+        log_barrier_histograms();
     }
 }
 
@@ -656,7 +689,10 @@ void on_dlss_evaluated(ID3D12GraphicsCommandList* list, const NVSDK_NGX_Handle* 
     if (list == nullptr || handle == nullptr || output == nullptr) {
         return;
     }
+    barrier_probe::note_eval(list, output, color);
     std::scoped_lock lock{g_mutex};
+    barrier_probe::g_self = true;
+    utility::ScopeGuard clear_self{[]() { barrier_probe::g_self = false; }};
     if (color != nullptr) {
         // The last evaluation before a Present is that frame's right eye; it overwrites earlier ones.
         auto& pair = g_pairs[g_pair_index % g_pairs.size()];
@@ -716,6 +752,7 @@ void quarter_monitor_on_present_capture(ID3D12CommandQueue* queue, ID3D12Resourc
     sample.allocator->Reset();
     sample.list->Reset(sample.allocator.Get(), nullptr);
     sample.frame = frame;
+    barrier_probe::g_self = true;
     const bool recorded = record(sample.list.Get(), capture, D3D12_RESOURCE_STATE_RENDER_TARGET, sample);
     // Pair slot for this Present (its DLSS columns were recorded by this frame's evaluations).
     const auto pair_index = g_pair_index % g_pairs.size();
@@ -724,6 +761,8 @@ void quarter_monitor_on_present_capture(ID3D12CommandQueue* queue, ID3D12Resourc
     const auto capture_desc = capture->GetDesc();
     record_column(sample.list.Get(), capture, D3D12_RESOURCE_STATE_RENDER_TARGET,
         static_cast<UINT>(capture_desc.Width / 4), capture_desc.Height / 2, pair.capture);
+    barrier_probe::g_self = false;
+    pair.barrier_events = barrier_probe::take_frame_events(capture);
     sample.list->Close();
     if (recorded) {
         ID3D12CommandList* lists[]{sample.list.Get()};
@@ -1110,6 +1149,122 @@ void WINAPI hk_ID3D12GraphicsCommandList_ResourceBarrier(ID3D12GraphicsCommandLi
         }
     }
 }
+
+// DIAGNOSTIC (Stalker 2 quarter-size right eye, strip before release): records every resource
+// state transition of the frame's DLSS inputs/outputs (eval 0 = left eye, eval 1 = right eye)
+// and of the Native Fix capture texture between two Presents. Attached to the pair verdict so
+// good and bad frames can be compared: which texture the pass writing the capture made readable.
+// Installed only when AFW's ResourceBarrier hook is absent; our own probe copies are excluded.
+namespace barrier_probe {
+thread_local bool g_self{};
+SafetyHookInline g_hook{};
+std::atomic<ID3D12Resource*> g_tracked[5]{}; // L.out, L.in, R.out, R.in, CAP
+std::mutex g_mutex{};
+std::string g_events{};
+uint32_t g_event_count{};
+uint32_t g_evals_this_frame{};
+constexpr const char* NAMES[5]{"Lout", "Lin", "Rout", "Rin", "CAP"};
+
+std::string state_name(D3D12_RESOURCE_STATES state) {
+    if (state == D3D12_RESOURCE_STATE_COMMON) {
+        return "COMMON";
+    }
+    std::string result{};
+    const auto add = [&](D3D12_RESOURCE_STATES bit, const char* name) {
+        if ((state & bit) == bit) {
+            if (!result.empty()) { result += "|"; }
+            result += name;
+            state = static_cast<D3D12_RESOURCE_STATES>(state & ~bit);
+        }
+    };
+    add(D3D12_RESOURCE_STATE_RENDER_TARGET, "RT");
+    add(D3D12_RESOURCE_STATE_UNORDERED_ACCESS, "UAV");
+    add(D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, "PSR");
+    add(D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, "NPSR");
+    add(D3D12_RESOURCE_STATE_COPY_SOURCE, "CSRC");
+    add(D3D12_RESOURCE_STATE_COPY_DEST, "CDST");
+    add(D3D12_RESOURCE_STATE_DEPTH_WRITE, "DW");
+    add(D3D12_RESOURCE_STATE_DEPTH_READ, "DR");
+    if (state != 0) {
+        result += fmt::format("{}0x{:x}", result.empty() ? "" : "|", static_cast<uint32_t>(state));
+    }
+    return result;
+}
+
+void WINAPI hk_resource_barrier(ID3D12GraphicsCommandList* list, UINT count, const D3D12_RESOURCE_BARRIER* barriers) {
+    g_hook.call(list, count, barriers);
+    if (g_self || barriers == nullptr) {
+        return;
+    }
+    ID3D12Resource* tracked[5]{};
+    bool any{};
+    for (size_t i = 0; i < 5; ++i) {
+        tracked[i] = g_tracked[i].load(std::memory_order_relaxed);
+        any |= tracked[i] != nullptr;
+    }
+    if (!any) {
+        return;
+    }
+    for (UINT b = 0; b < count; ++b) {
+        if (barriers[b].Type != D3D12_RESOURCE_BARRIER_TYPE_TRANSITION) {
+            continue;
+        }
+        const auto* resource = barriers[b].Transition.pResource;
+        for (size_t i = 0; i < 5; ++i) {
+            if (resource != nullptr && resource == tracked[i]) {
+                std::scoped_lock lock{g_mutex};
+                if (g_event_count++ < 24) {
+                    g_events += fmt::format(" {}:{}>{}", NAMES[i],
+                        state_name(barriers[b].Transition.StateBefore), state_name(barriers[b].Transition.StateAfter));
+                }
+            }
+        }
+    }
+}
+
+void install(ID3D12GraphicsCommandList* list) {
+    static bool attempted{};
+    if (attempted || list == nullptr) {
+        return;
+    }
+    attempted = true;
+    if (ResourceBarrier_Hook) {
+        spdlog::info("[BarrierProbe] AFW owns the ResourceBarrier hook; probe not installed");
+        return;
+    }
+    const auto target = (*reinterpret_cast<void***>(list))[26];
+    auto result = safetyhook::InlineHook::create(target, reinterpret_cast<void*>(hk_resource_barrier));
+    if (result) {
+        g_hook = std::move(result.value());
+    }
+    spdlog::info("[BarrierProbe] {} ID3D12GraphicsCommandList::ResourceBarrier at {:x}",
+        g_hook ? "Hooked" : "FAILED to hook", reinterpret_cast<uintptr_t>(target));
+}
+
+void note_eval(ID3D12GraphicsCommandList* list, ID3D12Resource* output, ID3D12Resource* input) {
+    install(list);
+    std::scoped_lock lock{g_mutex};
+    const auto eye = g_evals_this_frame++ == 0 ? 0 : 1;
+    g_tracked[eye * 2 + 0].store(output, std::memory_order_relaxed);
+    g_tracked[eye * 2 + 1].store(input, std::memory_order_relaxed);
+    if (g_event_count++ < 24) {
+        g_events += fmt::format(" [EVAL{}]", eye == 0 ? "L" : "R");
+    }
+}
+
+std::string take_frame_events(ID3D12Resource* capture) {
+    g_tracked[4].store(capture, std::memory_order_relaxed);
+    std::scoped_lock lock{g_mutex};
+    auto events = std::move(g_events);
+    if (g_event_count > 24) {
+        events += fmt::format(" (+{} more)", g_event_count - 24);
+    }
+    g_events.clear();
+    g_event_count = 0;
+    g_evals_this_frame = 0;
+    return events;
+}
+} // namespace barrier_probe
 
 // DSV descriptor -> depth resource. CreateDepthStencilView is free-threaded and UE5 creates DSVs from several
 // worker threads at once (level loads), so every access is locked: the unlocked map was corrupted by concurrent
