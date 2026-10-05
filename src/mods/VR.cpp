@@ -7,6 +7,7 @@
 #include <filesystem>
 #include <iomanip>
 #include <optional>
+#include <shared_mutex>
 #include <sstream>
 #include <string_view>
 #include <vector>
@@ -315,11 +316,17 @@ void WINAPI hk_ID3D12GraphicsCommandList_ResourceBarrier(ID3D12GraphicsCommandLi
     }
 }
 
+// DSV descriptor -> depth resource. CreateDepthStencilView is free-threaded and UE5 creates DSVs from several
+// worker threads at once (level loads), so every access is locked: the unlocked map was corrupted by concurrent
+// inserts and its lookups then spun forever (Stalker 2 level-load freeze 2026-10-04: two RHI worker threads at
+// 100% CPU inside DSVMap::operator[] here).
 static std::map<SIZE_T, ID3D12Resource*> DSVMap = {};
+static std::shared_mutex DSVMapMutex{};
 decltype(&ID3D12Device::CreateDepthStencilView) ptrCreateDepthStencilView; // 21
 void WINAPI hk_ID3D12Device_CreateDepthStencilView(
     ID3D12Device* This, ID3D12Resource* pResource, const D3D12_DEPTH_STENCIL_VIEW_DESC* pDesc, D3D12_CPU_DESCRIPTOR_HANDLE DestDescriptor) {
     (This->*ptrCreateDepthStencilView)(pResource, pDesc, DestDescriptor);
+    std::unique_lock lock{DSVMapMutex};
     DSVMap[DestDescriptor.ptr] = pResource;
 }
 
@@ -339,8 +346,14 @@ void WINAPI hk_ID3D12GraphicsCommandList_ClearDepthStencilView(ID3D12GraphicsCom
     auto render_frame_count = vr->get_render_frame_count();
     bool isNeverDLSS = vr->is_never_dlss();
     EyeIndex nEye = (render_frame_count % 2 == 0) ? EyeLeft : EyeRight;
-    if (isNeverDLSS && DSVMap.contains(DepthStencilView.ptr)) {
-        auto depth = DSVMap[DepthStencilView.ptr];
+    ID3D12Resource* depth = nullptr;
+    if (isNeverDLSS) {
+        std::shared_lock lock{DSVMapMutex};
+        if (const auto it = DSVMap.find(DepthStencilView.ptr); it != DSVMap.end()) {
+            depth = it->second;
+        }
+    }
+    if (depth != nullptr) {
         auto desc = depth->GetDesc();
         float aspectRatioX = float(desc.Width) / vr->finalSize[0];
         float aspectRatioY = float(desc.Height) / vr->finalSize[1];
