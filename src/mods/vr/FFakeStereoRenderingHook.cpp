@@ -890,15 +890,10 @@ public:
 
         const auto views_offset = *layout->views;
         const auto all_views_offset = views_offset + static_cast<uint32_t>(sizeof(RawArray));
-        // UE5.5: uint32 FrameNumber; uint64 FrameCounter; bool bAdditionalViewFamily; bool bRealtimeUpdate; ...
-        const auto frame_counter_offset = (frame_number_offset + sizeof(uint32_t) + 7u) & ~7u;
-        const auto additional_offset = frame_counter_offset + static_cast<uint32_t>(sizeof(uint64_t));
-        if (frame_number_offset == 0 || views_offset == 0 ||
-            *layout->render_target <= all_views_offset ||
-            frame_number_offset <= *layout->scene_interface ||
-            additional_offset + 8 > copy_size)
+        if (frame_number_offset != stalker2_frame_number_offset || views_offset != 0x08 ||
+            *layout->render_target != 0x30 || *layout->scene_interface != 0x40)
         {
-            failure_reason = "family field offsets are outside the proven UE5.5 order";
+            failure_reason = "family field offsets do not match the Stalker 2 UE5.5 constructor layout";
             return false;
         }
 
@@ -915,22 +910,67 @@ public:
             return false;
         }
 
-        // bAdditionalViewFamily=false and bRealtimeUpdate=true on the main game
-        // viewport family; the next five flags are plain bools.
+        // FSceneViewFamily(ConstructionValues) at RVA 0x51C9A writes
+        // bAdditionalViewFamily/bRealtimeUpdate/bDeferClear/bResolveScene to
+        // +0xC8..+0xCB from the CVS bitfield, then plain bools through
+        // bIsFirstViewInMultipleViewFamily (+0xD1, read by BeginRenderingViewFamilies).
         const auto* const flags = reinterpret_cast<const uint8_t*>(source_address + additional_offset);
         if (flags[0] != 0 || flags[1] != 1) {
             failure_reason = "bAdditionalViewFamily/bRealtimeUpdate did not validate";
             return false;
         }
-        for (size_t index = 2; index < 7; ++index) {
+        for (size_t index = 2; index < flag_span; ++index) {
             if (flags[index] > 1) {
                 failure_reason = "family flag bytes after bRealtimeUpdate are not bools";
                 return false;
             }
         }
 
+        // Inline-allocated per-family array rebuilt by BeginRenderingViewFamilies
+        // for every family (element 0x18, inline capacity 2). A shared heap
+        // buffer would let the engine write into, or reallocate, the source's.
+        RawArray source_inline_array{};
+        std::memcpy(&source_inline_array, reinterpret_cast<const void*>(source_address + inline_array_data_offset), sizeof(source_inline_array));
+        if (source_inline_array.count < 0 || source_inline_array.capacity < inline_array_inline_capacity ||
+            source_inline_array.count > source_inline_array.capacity || source_inline_array.capacity > 256 ||
+            (source_inline_array.data == nullptr && source_inline_array.capacity != inline_array_inline_capacity))
+        {
+            failure_reason = "per-family inline array did not validate";
+            return false;
+        }
+
         std::memcpy(m_storage.data(), source, copy_size);
         auto* const object = reinterpret_cast<uint8_t*>(m_storage.data());
+
+        if (source_inline_array.data != nullptr) {
+            const auto needed = static_cast<size_t>(source_inline_array.capacity);
+            if (m_inline_array_heap == nullptr || m_inline_array_heap_capacity < needed) {
+                auto* const allocator = sdk::FMalloc::get();
+                if (allocator == nullptr) {
+                    failure_reason = "engine allocator is unavailable";
+                    return false;
+                }
+                if (m_inline_array_heap != nullptr) {
+                    allocator->free(m_inline_array_heap);
+                }
+                m_inline_array_heap = allocator->malloc(needed * inline_array_element_size, 16);
+                m_inline_array_heap_capacity = m_inline_array_heap != nullptr ? needed : 0;
+                if (m_inline_array_heap == nullptr) {
+                    failure_reason = "engine allocation for the per-family array failed";
+                    return false;
+                }
+            }
+
+            std::memcpy(m_inline_array_heap, source_inline_array.data,
+                static_cast<size_t>(source_inline_array.count) * inline_array_element_size);
+            const RawArray clone_inline_array{
+                m_inline_array_heap,
+                source_inline_array.count,
+                static_cast<int32_t>(m_inline_array_heap_capacity),
+            };
+            std::memcpy(object + inline_array_data_offset, &clone_inline_array, sizeof(clone_inline_array));
+        }
+        m_expected_inline_array_data = *reinterpret_cast<void**>(object + inline_array_data_offset);
 
         m_views[0] = right_view;
         const RawArray views{m_views.data(), 1, 1};
@@ -943,14 +983,11 @@ public:
         m_object = reinterpret_cast<sdk::FSceneViewFamily*>(object);
 
         SPDLOG_INFO_ONCE(
-            "[Stalker2][UE5.5][NativeStereoFix][Linked] Clone layout views=0x{:x} all_views=0x{:x} rt=0x{:x} "
-            "scene=0x{:x} frame=0x{:x} frame_counter=0x{:x} additional=0x{:x} flags={:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} "
-            "frame_number={} frame_counter_value={}",
-            views_offset, all_views_offset, *layout->render_target, *layout->scene_interface,
-            frame_number_offset, frame_counter_offset, additional_offset,
-            flags[0], flags[1], flags[2], flags[3], flags[4], flags[5], flags[6],
-            *reinterpret_cast<const uint32_t*>(source_address + frame_number_offset),
-            *reinterpret_cast<const uint64_t*>(source_address + frame_counter_offset));
+            "[Stalker2][UE5.5][NativeStereoFix][Linked] Clone flags(+0xC8..+0xD1)={:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} {:02x} "
+            "inline_array data={:x} count={} max={} frame_number={}",
+            flags[0], flags[1], flags[2], flags[3], flags[4], flags[5], flags[6], flags[7], flags[8], flags[9],
+            reinterpret_cast<uintptr_t>(source_inline_array.data), source_inline_array.count, source_inline_array.capacity,
+            *reinterpret_cast<const uint32_t*>(source_address + frame_number_offset));
         return true;
     }
 
@@ -969,13 +1006,49 @@ public:
         return views.data == m_views.data() && views.count == 1;
     }
 
+    // If the engine grew the per-family array it reallocated through FMalloc;
+    // adopt the new heap block (never the clone's inline storage) so it is reused.
+    void adopt_inline_array_after_render() {
+        if (m_object == nullptr) {
+            return;
+        }
+
+        RawArray current{};
+        std::memcpy(&current, reinterpret_cast<const uint8_t*>(m_object) + inline_array_data_offset, sizeof(current));
+        if (current.data == m_expected_inline_array_data) {
+            return;
+        }
+
+        SPDLOG_INFO_EVERY_N_SEC(
+            10,
+            "[Stalker2][UE5.5][NativeStereoFix][Linked] Per-family array reallocated by the engine data={:x} max={}",
+            reinterpret_cast<uintptr_t>(current.data),
+            current.capacity);
+        if (current.data != nullptr) {
+            m_inline_array_heap = current.data;
+            m_inline_array_heap_capacity = static_cast<size_t>(std::max(current.capacity, 0));
+        } else {
+            m_inline_array_heap = nullptr;
+            m_inline_array_heap_capacity = 0;
+        }
+    }
+
 private:
     static constexpr size_t copy_size = 0x400;
+    static constexpr uint32_t stalker2_frame_number_offset = 0xAC;
+    static constexpr size_t additional_offset = 0xC8;
+    static constexpr size_t flag_span = 10; // +0xC8..+0xD1
+    static constexpr size_t inline_array_data_offset = 0x168;
+    static constexpr size_t inline_array_element_size = 0x18;
+    static constexpr int32_t inline_array_inline_capacity = 2;
 
     alignas(16) std::array<uint8_t, copy_size> m_storage{};
     std::array<sdk::FSceneView*, 1> m_views{};
     uint32_t m_views_offset{};
     sdk::FSceneViewFamily* m_object{};
+    void* m_inline_array_heap{};
+    size_t m_inline_array_heap_capacity{};
+    void* m_expected_inline_array_data{};
 };
 
 std::mutex g_shf_texture_probe_mutex{};
@@ -25129,6 +25202,7 @@ void FFakeStereoRenderingHook::begin_render_viewfamily_real(void* render_module,
                 native_right_view->get_view_family() == view_family ||
                 try_set_ue57_scene_view_family(native_right_view, right_family, view_family);
             const bool clone_views_intact = right_family_clone.views_intact();
+            right_family_clone.adopt_inline_array_after_render();
 
             views.data[0] = original_first;
             views.data[1] = original_second;
