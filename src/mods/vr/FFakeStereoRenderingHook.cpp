@@ -40650,8 +40650,11 @@ bool VRRenderTargetManager_Base::create_scene_capture() try {
         daysgone_is_current_game() &&
         g_framework != nullptr &&
         g_framework->is_dx11();
+    // Stalker 2 is also UE5.5.4: a registered capture component can be rendered
+    // by the engine's own scene-capture path (no DLSS, render-res) straight into
+    // the Native Fix right-eye target -> intermittent quarter-size right eye.
     const auto use_bodycam_passive_capture_holder =
-        bodycam_ue554_is_current_game() &&
+        (bodycam_ue554_is_current_game() || stalker2_uses_validated_ue55_native_fix_capture_layout()) &&
         g_framework != nullptr &&
         g_framework->is_dx12();
     if (use_daysgone_legacy_component) {
@@ -40725,7 +40728,8 @@ bool VRRenderTargetManager_Base::create_scene_capture() try {
         this->scene_capture_component->set_texture_target(tgt);
         this->scene_capture_component->set_visibility(false);
         SPDLOG_INFO_ONCE(
-            "[Bodycam][UE5.5.4][NativeStereoFix] Using an unregistered passive scene-capture holder");
+            "[UE5.5.4][NativeStereoFix] Using an unregistered passive scene-capture holder ({})",
+            bodycam_ue554_is_current_game() ? "Bodycam" : "Stalker 2");
     } else {
         this->scene_capture_component->set_texture_target(tgt);
 
