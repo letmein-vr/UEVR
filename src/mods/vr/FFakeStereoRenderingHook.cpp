@@ -956,11 +956,20 @@ void track_fields(size_t index, const char* label, uintptr_t base, size_t size, 
         tracker.primed = false;
     }
     const auto* words = reinterpret_cast<const uint32_t*>(base);
+    // Right-eye-only candidates seen in the summaries: log every change in this window.
+    const bool is_view = (index % 2) == 0;
+    static std::array<uint32_t, 2> watch_logged{};
     for (size_t i = 0; i < count; ++i) {
         const auto value = words[i];
         if (!tracker.primed) {
             tracker.last[i] = value;
             continue;
+        }
+        const auto offset = static_cast<uint32_t>(i * sizeof(uint32_t));
+        if (is_view && offset >= 0x2FF0 && offset <= 0x300C && value != tracker.last[i] && watch_logged[index / 2] < 3000) {
+            ++watch_logged[index / 2];
+            SPDLOG_INFO("[Stalker2][ViewWatch] {} +0x{:x}: {} -> {} frame={}", label, offset,
+                static_cast<int32_t>(tracker.last[i]), static_cast<int32_t>(value), frame);
         }
         if (value == tracker.last[i]) {
             if (tracker.stable[i] < 60000) {
@@ -969,9 +978,10 @@ void track_fields(size_t index, const char* label, uintptr_t base, size_t size, 
             continue;
         }
         if (tracker.stable[i] >= 60) {
-            const auto offset = static_cast<uint32_t>(i * sizeof(uint32_t));
             const auto departures = ++tracker.departures[offset];
-            if (tracker.logged < 400 && departures <= 6) {
+            // Skip right-eye fields that also depart on the left eye (the left eye never goes bad).
+            const bool also_left = index >= 2 && g_field_trackers[index - 2].departures.contains(offset);
+            if (!also_left && tracker.logged < 3000 && departures <= 30) {
                 ++tracker.logged;
                 float old_float{}, new_float{};
                 std::memcpy(&old_float, &tracker.last[i], sizeof(old_float));
