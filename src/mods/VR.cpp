@@ -7973,32 +7973,6 @@ void VR::update_hmd_state(bool from_view_extensions, uint32_t frame_count) {
                 sdk::set_cvar_int(L"Renderer", L"r.InstanceCulling.OcclusionCull", 0);
             }
         }
-
-        // Stalker 2 Native Fix renders the right eye into a capture target half the
-        // width of the double-wide viewport, so the shared scene-texture extent keeps
-        // resizing between the two families; with DLSS that intermittently leaves the
-        // right eye quarter-size. Grow-only extents avoid it (A/B confirmed live).
-        if (m_native_stereo_fix_stalker2_grow_only_scene_textures->value() &&
-            is_native_stereo_fix_enabled() && stalker2_native_fix_requires_same_pass_cached())
-        {
-            static uint32_t enforce_attempts{};
-            const auto force_override = sdk::get_cvar_int(L"Renderer", L"r.SceneRenderTargetResizeMethodForceOverride");
-            const auto resize_method = sdk::get_cvar_int(L"Renderer", L"r.SceneRenderTargetResizeMethod");
-            const bool needs_set =
-                (force_override && *force_override != 1) || (resize_method && *resize_method != 2);
-            if (needs_set && enforce_attempts < 20) {
-                ++enforce_attempts;
-                sdk::set_cvar_int(L"Renderer", L"r.SceneRenderTargetResizeMethodForceOverride", 1);
-                sdk::set_cvar_int(L"Renderer", L"r.SceneRenderTargetResizeMethod", 2);
-                SPDLOG_INFO(
-                    "[Stalker2][NativeStereoFix] Forcing grow-only scene textures (ForceOverride {} -> 1, ResizeMethod {} -> 2, attempt {})",
-                    force_override.value_or(-1),
-                    resize_method.value_or(-1),
-                    enforce_attempts);
-            } else if (!needs_set && force_override && resize_method) {
-                SPDLOG_INFO_ONCE("[Stalker2][NativeStereoFix] Grow-only scene textures active");
-            }
-        }
     }
 
     if (frame_count != 0 && is_using_afr() && frame_count % 2 == 0) {
@@ -9594,18 +9568,6 @@ void VR::on_draw_sidebar_entry(std::string_view name) {
                 m_native_stereo_fix_same_pass->draw("Use Same Stereo Pass");
             }
             m_native_stereo_fix_preserve_secondary_pass->draw("Preserve Secondary Pass on UE5.5+");
-            if (stalker2_native_fix_requires_same_pass_cached()) {
-                m_native_stereo_fix_ue55_linked_family->draw("Stalker 2: Linked Right-Eye Family");
-                if (ImGui::IsItemHovered()) {
-                    ImGui::SetTooltip("Renders both eyes in one renderer transaction (left family + additional right family) "
-                                      "instead of re-rendering the same family.");
-                }
-                m_native_stereo_fix_stalker2_grow_only_scene_textures->draw("Stalker 2: Grow-Only Scene Textures");
-                if (ImGui::IsItemHovered()) {
-                    ImGui::SetTooltip("Forces r.SceneRenderTargetResizeMethod 2 (grow only). Fixes the intermittent quarter-size "
-                                      "right eye with DLSS. Turning it off does not restore the previous cvar values until restart.");
-                }
-            }
             if (uevr::nascar::is_target()) {
                 ImGui::EndDisabled();
                 ImGui::TextWrapped("NASCAR keeps the original eye indices/history and temporarily gives the right singleton a primary pass only while creating its renderer. These generic pass options are not used.");
