@@ -457,185 +457,12 @@ void maybe_summary() {
         g_points[1].bad, g_points[1].scored, g_points[1].unreadable, handles);
 }
 
-// Pair check: per Present, one column (25% of the width) of the capture, of the frame's last
-// DLSS output (= right eye) and of that DLSS input taken 1:1. Brightness-profile correlation
-// tells which image the capture really shows: the upscaled output (good) or the low-res input
-// read 1:1 (the quarter-size theory). Tonemapping is monotonic, so correlation survives it.
-struct ColumnCopy {
-    Microsoft::WRL::ComPtr<ID3D12Resource> readback{};
-    D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint{};
-    UINT64 size{};
-    DXGI_FORMAT format{};
-    bool recorded{};
-};
-
-struct PairSlot {
-    ColumnCopy capture{}, output{}, input{};
-    uintptr_t handle{};
-    uint32_t frame{};
-};
-
-std::array<PairSlot, 8> g_pairs{};
-uint32_t g_pair_index{};
-struct PairStats {
-    uint64_t matches_output{}, matches_input{}, ambiguous{}, flat{}, logged_input{}, logged_output{};
-} g_pair_stats{};
-
-bool record_column(ID3D12GraphicsCommandList* list, ID3D12Resource* texture, D3D12_RESOURCE_STATES state, UINT x, UINT rows, ColumnCopy& copy) {
-    copy.recorded = false;
-    const auto desc = texture->GetDesc();
-    if (desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || x >= desc.Width) {
-        return false;
-    }
-    rows = std::min<UINT>(rows, desc.Height);
-    Microsoft::WRL::ComPtr<ID3D12Device> device{};
-    if (FAILED(texture->GetDevice(IID_PPV_ARGS(&device)))) {
-        return false;
-    }
-    auto column_desc = desc;
-    column_desc.Width = 1;
-    column_desc.Height = rows;
-    column_desc.DepthOrArraySize = 1;
-    column_desc.MipLevels = 1;
-    UINT row_count{};
-    UINT64 row_size{}, total_size{};
-    device->GetCopyableFootprints(&column_desc, 0, 1, 0, &copy.footprint, &row_count, &row_size, &total_size);
-    if (copy.readback == nullptr || copy.size < total_size) {
-        D3D12_HEAP_PROPERTIES heap{};
-        heap.Type = D3D12_HEAP_TYPE_READBACK;
-        D3D12_RESOURCE_DESC buffer_desc{};
-        buffer_desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
-        buffer_desc.Width = total_size;
-        buffer_desc.Height = 1;
-        buffer_desc.DepthOrArraySize = 1;
-        buffer_desc.MipLevels = 1;
-        buffer_desc.SampleDesc.Count = 1;
-        buffer_desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
-        copy.readback.Reset();
-        if (FAILED(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &buffer_desc,
-                D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&copy.readback)))) {
-            copy.size = 0;
-            return false;
-        }
-        copy.size = total_size;
-    }
-    copy.format = desc.Format;
-
-    D3D12_RESOURCE_BARRIER barrier{};
-    barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-    barrier.Transition.pResource = texture;
-    barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-    barrier.Transition.StateBefore = state;
-    barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
-    list->ResourceBarrier(1, &barrier);
-    D3D12_TEXTURE_COPY_LOCATION dst{};
-    dst.pResource = copy.readback.Get();
-    dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
-    dst.PlacedFootprint = copy.footprint;
-    D3D12_TEXTURE_COPY_LOCATION src{};
-    src.pResource = texture;
-    src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-    D3D12_BOX box{x, 0, 0, x + 1, rows, 1};
-    list->CopyTextureRegion(&dst, 0, 0, 0, &src, &box);
-    std::swap(barrier.Transition.StateBefore, barrier.Transition.StateAfter);
-    list->ResourceBarrier(1, &barrier);
-    copy.recorded = true;
-    return true;
-}
-
-std::vector<float> read_luma(ColumnCopy& copy) {
-    std::vector<float> luma{};
-    if (!copy.recorded || copy.readback == nullptr) {
-        return luma;
-    }
-    uint8_t* mapped{};
-    D3D12_RANGE range{0, static_cast<SIZE_T>(copy.size)};
-    if (FAILED(copy.readback->Map(0, &range, reinterpret_cast<void**>(&mapped)))) {
-        return luma;
-    }
-    luma.reserve(copy.footprint.Footprint.Height);
-    for (UINT y = 0; y < copy.footprint.Footprint.Height; ++y) {
-        int rgb[3]{};
-        if (!texel_rgb(copy.format, mapped + copy.footprint.Offset + static_cast<size_t>(y) * copy.footprint.Footprint.RowPitch, rgb)) {
-            luma.clear();
-            break;
-        }
-        luma.push_back(0.2126f * rgb[0] + 0.7152f * rgb[1] + 0.0722f * rgb[2]);
-    }
-    D3D12_RANGE none{0, 0};
-    copy.readback->Unmap(0, &none);
-    copy.recorded = false;
-    return luma;
-}
-
-// Pearson correlation of a[0..n) and b[0..n); NaN if either is flat.
-float correlate(const std::vector<float>& a, const std::vector<float>& b, size_t n) {
-    n = std::min({n, a.size(), b.size()});
-    if (n < 16) {
-        return std::numeric_limits<float>::quiet_NaN();
-    }
-    double ma{}, mb{};
-    for (size_t i = 0; i < n; ++i) { ma += a[i]; mb += b[i]; }
-    ma /= n; mb /= n;
-    double sab{}, saa{}, sbb{};
-    for (size_t i = 0; i < n; ++i) {
-        const double da = a[i] - ma, db = b[i] - mb;
-        sab += da * db; saa += da * da; sbb += db * db;
-    }
-    if (saa < n * 4.0 || sbb < n * 4.0) {
-        return std::numeric_limits<float>::quiet_NaN();
-    }
-    return static_cast<float>(sab / std::sqrt(saa * sbb));
-}
-
-void score_pair(PairSlot& slot) {
-    const auto capture = read_luma(slot.capture);
-    const auto output = read_luma(slot.output);
-    const auto input = read_luma(slot.input);
-    if (capture.empty() || output.empty() || input.empty()) {
-        return;
-    }
-    // Rows 0..min: capture and output share full-res coordinates; the 1:1 input theory says
-    // capture row y shows input row y.
-    const auto rows = std::min({capture.size(), output.size(), input.size()});
-    const auto c_out = correlate(capture, output, rows);
-    const auto c_in = correlate(capture, input, rows);
-    if (std::isnan(c_out) || std::isnan(c_in)) {
-        ++g_pair_stats.flat;
-        return;
-    }
-    if (c_in > c_out + 0.2f) {
-        ++g_pair_stats.matches_input;
-        if (g_pair_stats.logged_input++ < 40 || g_pair_stats.matches_input % 200 == 0) {
-            SPDLOG_INFO("[QuarterMonitor][Pair] CAPTURE MATCHES DLSS INPUT 1:1 #{} frame={} handle={:x} corr_output={:.2f} corr_input={:.2f} rows={}",
-                g_pair_stats.matches_input, slot.frame, slot.handle, c_out, c_in, rows);
-        }
-    } else if (c_out > c_in + 0.2f) {
-        ++g_pair_stats.matches_output;
-        if (g_pair_stats.logged_output++ < 5) {
-            SPDLOG_INFO("[QuarterMonitor][Pair] capture matches DLSS output (baseline) frame={} handle={:x} corr_output={:.2f} corr_input={:.2f} rows={}",
-                slot.frame, slot.handle, c_out, c_in, rows);
-        }
-    } else {
-        ++g_pair_stats.ambiguous;
-    }
-}
-
 // Point B: called on the NGX command list right after the original EvaluateFeature.
-void on_dlss_evaluated(ID3D12GraphicsCommandList* list, const NVSDK_NGX_Handle* handle, ID3D12Resource* output, ID3D12Resource* color, uint32_t frame) {
+void on_dlss_evaluated(ID3D12GraphicsCommandList* list, const NVSDK_NGX_Handle* handle, ID3D12Resource* output, uint32_t frame) {
     if (list == nullptr || handle == nullptr || output == nullptr) {
         return;
     }
     std::scoped_lock lock{g_mutex};
-    if (color != nullptr) {
-        // The last evaluation before a Present is that frame's right eye; it overwrites earlier ones.
-        auto& pair = g_pairs[g_pair_index % g_pairs.size()];
-        const auto out_desc = output->GetDesc();
-        const auto x = static_cast<UINT>(out_desc.Width / 4);
-        pair.handle = reinterpret_cast<uintptr_t>(handle);
-        record_column(list, output, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, x, static_cast<UINT>(out_desc.Height / 2), pair.output);
-        record_column(list, color, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, x, static_cast<UINT>(out_desc.Height / 2), pair.input);
-    }
     const auto key = reinterpret_cast<uintptr_t>(handle);
     auto& ring = g_handle_rings[key];
     auto& index = g_handle_ring_index[key];
@@ -687,43 +514,11 @@ void quarter_monitor_on_present_capture(ID3D12CommandQueue* queue, ID3D12Resourc
     sample.list->Reset(sample.allocator.Get(), nullptr);
     sample.frame = frame;
     const bool recorded = record(sample.list.Get(), capture, D3D12_RESOURCE_STATE_RENDER_TARGET, sample);
-    // Pair slot for this Present (its DLSS columns were recorded by this frame's evaluations).
-    const auto pair_index = g_pair_index % g_pairs.size();
-    auto& pair = g_pairs[pair_index];
-    pair.frame = frame;
-    const auto capture_desc = capture->GetDesc();
-    record_column(sample.list.Get(), capture, D3D12_RESOURCE_STATE_RENDER_TARGET,
-        static_cast<UINT>(capture_desc.Width / 4), capture_desc.Height / 2, pair.capture);
     sample.list->Close();
     if (recorded) {
         ID3D12CommandList* lists[]{sample.list.Get()};
         queue->ExecuteCommandLists(1, lists);
         queue->Signal(sample.fence.Get(), ++sample.fence_value);
-    }
-
-    // Free the next pair slot before the next frame's evaluations write into it: it was
-    // submitted 7 Presents ago with ring[next]'s fence.
-    ++g_pair_index;
-    const auto next_index = g_pair_index % g_pairs.size();
-    auto& next_sample = ring[next_index % ring.size()];
-    auto& next_pair = g_pairs[next_index];
-    if (next_pair.capture.recorded) {
-        if (next_sample.fence != nullptr && next_sample.fence->GetCompletedValue() < next_sample.fence_value) {
-            const auto event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
-            next_sample.fence->SetEventOnCompletion(next_sample.fence_value, event);
-            WaitForSingleObject(event, 500);
-            CloseHandle(event);
-        }
-        score_pair(next_pair);
-    }
-    next_pair.capture.recorded = next_pair.output.recorded = next_pair.input.recorded = false;
-
-    const auto now = GetTickCount64();
-    static ULONGLONG last_pair_summary_ms{};
-    if (now - last_pair_summary_ms >= 10000) {
-        last_pair_summary_ms = now;
-        SPDLOG_INFO("[QuarterMonitor][Pair] capture shows: DLSS output={} | DLSS input 1:1={} | ambiguous={} | flat/unscorable={}",
-            g_pair_stats.matches_output, g_pair_stats.matches_input, g_pair_stats.ambiguous, g_pair_stats.flat);
     }
     maybe_summary();
 }
@@ -911,10 +706,8 @@ NVSDK_NGX_Result hk_evaluate(ID3D12GraphicsCommandList* cmd, const NVSDK_NGX_Han
     const auto result = g_evaluate_hook.call<NVSDK_NGX_Result>(cmd, handle, params, callback);
     if (params != nullptr) {
         ID3D12Resource* output{};
-        ID3D12Resource* color{};
         params->Get(NVSDK_NGX_Parameter_Output, &output);
-        params->Get(NVSDK_NGX_Parameter_Color, &color);
-        quarter_monitor::on_dlss_evaluated(cmd, handle, output, color, render_frame());
+        quarter_monitor::on_dlss_evaluated(cmd, handle, output, render_frame());
     }
     return result;
 }
