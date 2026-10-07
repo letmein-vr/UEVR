@@ -260,26 +260,6 @@ bool texel_rgb(DXGI_FORMAT format, const uint8_t* texel, int out[3]) {
     case DXGI_FORMAT_R32G32B32A32_FLOAT:
         std::memcpy(rgb, texel, sizeof(rgb));
         break;
-    case DXGI_FORMAT_R11G11B10_FLOAT: {
-        // 11/11/10-bit unsigned floats: 5-bit exponent (bias 15), 6/6/5-bit mantissa.
-        uint32_t v{};
-        std::memcpy(&v, texel, sizeof(v));
-        const auto small_float = [](uint32_t value, uint32_t mantissa_bits) {
-            const uint32_t exponent = value >> mantissa_bits;
-            const uint32_t mantissa = value & ((1u << mantissa_bits) - 1);
-            if (exponent == 0) {
-                return std::ldexp(static_cast<float>(mantissa) / (1u << mantissa_bits), -14);
-            }
-            if (exponent == 31) {
-                return 65504.0f;
-            }
-            return std::ldexp(1.0f + static_cast<float>(mantissa) / (1u << mantissa_bits), static_cast<int>(exponent) - 15);
-        };
-        rgb[0] = small_float(v & 0x7FF, 6);
-        rgb[1] = small_float((v >> 11) & 0x7FF, 6);
-        rgb[2] = small_float((v >> 22) & 0x3FF, 5);
-        break;
-    }
     case DXGI_FORMAT_R10G10B10A2_UNORM:
     case DXGI_FORMAT_R10G10B10A2_TYPELESS: {
         uint32_t v{};
@@ -609,20 +589,10 @@ float correlate(const std::vector<float>& a, const std::vector<float>& b, size_t
 }
 
 void score_pair(PairSlot& slot) {
-    const auto capture_format = slot.capture.format;
-    const auto output_format = slot.output.format;
-    const auto input_format = slot.input.format;
-    const bool had_output = slot.output.recorded;
-    const bool had_input = slot.input.recorded;
     const auto capture = read_luma(slot.capture);
     const auto output = read_luma(slot.output);
     const auto input = read_luma(slot.input);
     if (capture.empty() || output.empty() || input.empty()) {
-        ++g_pair_stats.flat;
-        SPDLOG_INFO_EVERY_N_SEC(10,
-            "[QuarterMonitor][Pair] unscorable: capture rows={} (fmt {}) output rows={} (fmt {}, recorded={}) input rows={} (fmt {}, recorded={})",
-            capture.size(), static_cast<int>(capture_format), output.size(), static_cast<int>(output_format), had_output,
-            input.size(), static_cast<int>(input_format), had_input);
         return;
     }
     // Rows 0..min: capture and output share full-res coordinates; the 1:1 input theory says
