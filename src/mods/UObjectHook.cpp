@@ -410,6 +410,132 @@ bool is_stalker2_uobjecthook_guard_enabled() {
     return result;
 }
 
+// Stalker 2 (UE 5.5.4): ~UObjectBase is trivial, so there is no destructor to hook (the
+// generic discovery ends up on the allocator's Free). Array slots are released by a
+// FreeUObjectIndex copy inlined into the GC purge loop, plus one in StaticAllocateObject's
+// in-place reuse. Both run the "index points to a different object" check as
+//     cmp rax, <object> ; jne <cold fatal block> ; <resume>
+// and the cold block (lea rdx, <log record> ... mov r8, <object> ... call ; jmp <resume>)
+// names the register. <resume> is reached once per freed object, slot still intact.
+std::vector<ObjectFreeSite> find_stalker2_object_free_sites() {
+    const auto executable = utility::get_executable();
+    const auto matches = utility::scan_strings(executable,
+        std::wstring{L"Removing object (0x%016llx) at index %d but the index points to a different object"});
+    if (matches.size() != 1) {
+        SPDLOG_WARN("[Stalker2][UObjectHook] FreeUObjectIndex diagnostic not unique ({} matches)", matches.size());
+        return {};
+    }
+
+    // The code references the static log record, whose first field points at the format string.
+    const auto record = utility::scan_ptr(executable, matches.front());
+    if (!record) {
+        SPDLOG_WARN("[Stalker2][UObjectHook] FreeUObjectIndex log record not found");
+        return {};
+    }
+
+    std::vector<ObjectFreeSite> sites{};
+
+    for (const auto reference : utility::scan_displacement_references(executable, *record)) {
+        const auto lea = utility::resolve_instruction(reference);
+        if (!lea || std::string_view{lea->instrux.Mnemonic} != "LEA") {
+            continue;
+        }
+
+        std::optional<uint32_t> object_register{};
+        std::optional<uintptr_t> after_call{};
+        auto ip = lea->addr;
+
+        for (size_t i = 0; i < 12 && !after_call; ++i) {
+            const auto insn = utility::decode_one((uint8_t*)ip);
+            if (!insn) {
+                break;
+            }
+
+            const std::string_view mnemonic{insn->Mnemonic};
+            const auto& dst = insn->Operands[0];
+            const auto& src = insn->Operands[1];
+
+            if (mnemonic == "MOV" && dst.Type == ND_OP_REG && dst.Info.Register.Type == ND_REG_GPR &&
+                dst.Info.Register.Reg == NDR_R8 && dst.Size == 8 &&
+                src.Type == ND_OP_REG && src.Info.Register.Type == ND_REG_GPR) {
+                object_register = src.Info.Register.Reg;
+            } else if (mnemonic.starts_with("CALL")) {
+                after_call = ip + insn->Length;
+            }
+
+            ip += insn->Length;
+        }
+
+        if (!object_register || !after_call) {
+            SPDLOG_WARN("[Stalker2][UObjectHook] FreeUObjectIndex site at {:x} has unexpected shape", lea->addr);
+            continue;
+        }
+
+        // Only callee-saved registers survive the (skipped) fatal call unchanged.
+        switch (*object_register) {
+        case NDR_RBX: case NDR_RBP: case NDR_RSI: case NDR_RDI:
+        case NDR_R12: case NDR_R13: case NDR_R14: case NDR_R15:
+            break;
+        default:
+            SPDLOG_WARN("[Stalker2][UObjectHook] FreeUObjectIndex site at {:x} uses volatile register {}", lea->addr, *object_register);
+            continue;
+        }
+
+        // The cold block jumps back to the hot path, at most past a couple of register reloads.
+        std::optional<uintptr_t> resume{};
+        ip = *after_call;
+
+        for (size_t i = 0; i < 4 && !resume; ++i) {
+            if (*(uint8_t*)ip == 0xE9) {
+                resume = ip + 5 + *(int32_t*)(ip + 1);
+                break;
+            }
+
+            const auto insn = utility::decode_one((uint8_t*)ip);
+            if (!insn || std::string_view{insn->Mnemonic} != "MOV") {
+                break;
+            }
+
+            ip += insn->Length;
+        }
+
+        if (!resume) {
+            SPDLOG_WARN("[Stalker2][UObjectHook] FreeUObjectIndex site at {:x} does not jump back", lea->addr);
+            continue;
+        }
+
+        // The resume point must directly follow "cmp rax, <object> ; jne <this cold block>".
+        const auto jne = *resume - 6;
+        const auto cmp = utility::decode_one((uint8_t*)(*resume - 9));
+        const auto jne_target = jne + 6 + *(int32_t*)(jne + 2);
+        const bool jne_ok = *(uint8_t*)jne == 0x0F && *(uint8_t*)(jne + 1) == 0x85 &&
+            jne_target <= lea->addr && lea->addr - jne_target <= 0x20;
+        const bool cmp_ok = cmp && cmp->Length == 3 && std::string_view{cmp->Mnemonic} == "CMP" &&
+            cmp->Operands[0].Type == ND_OP_REG && cmp->Operands[0].Info.Register.Reg == NDR_RAX &&
+            cmp->Operands[1].Type == ND_OP_REG && cmp->Operands[1].Info.Register.Type == ND_REG_GPR &&
+            cmp->Operands[1].Info.Register.Reg == *object_register;
+
+        if (!jne_ok || !cmp_ok) {
+            SPDLOG_WARN("[Stalker2][UObjectHook] FreeUObjectIndex site at {:x} resumes at {:x} without the slot check", lea->addr, *resume);
+            continue;
+        }
+
+        // A mid hook needs 5 bytes; keep it inside one plain instruction so no branch
+        // target or RIP-relative operand ends up in the relocated bytes.
+        const auto first = utility::decode_one((uint8_t*)*resume);
+        if (!first || first->Length < 5 || first->IsRipRelative || first->BranchInfo.IsBranch) {
+            SPDLOG_WARN("[Stalker2][UObjectHook] FreeUObjectIndex resume point {:x} is not hookable", *resume);
+            continue;
+        }
+
+        if (std::ranges::none_of(sites, [&](const auto& site) { return site.address == *resume; })) {
+            sites.push_back({*resume, *object_register});
+        }
+    }
+
+    return sites;
+}
+
 bool is_everwind_uobjecthook_guard_enabled() {
     static const bool result = []() {
         const auto exe_path = utility::get_module_pathw(utility::get_executable());
@@ -1204,7 +1330,18 @@ void UObjectHook::hook() {
         SPDLOG_WARN("[UObjectHook] UObjectBase::AddObject was not found; using incremental FUObjectArray creation tracking");
     }
 
-    if (sdk::kh3::is_process()) {
+    // Stalker 2 (UE 5.5.4): ~UObjectBase is trivial, so destructor discovery rejects its
+    // candidate and falls back to "the first call we find" - the allocator's Free. Hooked,
+    // that ran this mod's lock on every free in the game, on every thread, and still missed
+    // GC'd objects (the purge frees through other copies of Free), so an entry was only
+    // dropped when its address happened to be freed again. Hook the real FreeUObjectIndex
+    // sites instead; the Free hook stays only as the fallback when none of them validate.
+    const bool stalker2_object_free_sites = is_stalker2_uobjecthook_guard_enabled() && install_object_free_hooks();
+
+    if (stalker2_object_free_sites) {
+        SPDLOG_INFO("[Stalker2][UObjectHook] Tracking object death at {} FreeUObjectIndex site(s); not hooking {:x}",
+            m_object_free_hooks.size(), (uintptr_t)destructor_fn.value());
+    } else if (sdk::kh3::is_process()) {
         m_destructor_hook = safetyhook::create_inline((void*)destructor_fn.value(), &destructor,
             safetyhook::InlineHook::StartDisabled);
         if (m_destructor_hook && !m_destructor_hook.enable()) { m_destructor_hook.reset(); }
@@ -1212,7 +1349,7 @@ void UObjectHook::hook() {
         m_destructor_hook = safetyhook::create_inline((void**)destructor_fn.value(), &destructor);
     }
 
-    if (!m_destructor_hook) {
+    if (!stalker2_object_free_sites && !m_destructor_hook) {
         SPDLOG_ERROR("[UObjectHook] Failed to hook UObjectBase::destructor, cannot hook UObjectBase");
         return;
     }
@@ -1223,6 +1360,15 @@ void UObjectHook::hook() {
         // Safety net for anything freed through a path the free hooks don't cover.
         m_validate_tracked_identity.store(true, std::memory_order_relaxed);
         SPDLOG_INFO("[Townfall][UObjectHook] Tracked-object identity validation enabled");
+    }
+
+    if (is_stalker2_uobjecthook_guard_enabled()) {
+        // Safety net for anything freed through a path the free hooks don't cover (and the
+        // whole answer on the Free-hook fallback, where every object alive at a world change
+        // stayed tracked and exists() kept passing for freed memory after an in-game save load):
+        // check each lookup against the FUObjectArray slot.
+        m_validate_tracked_identity.store(true, std::memory_order_relaxed);
+        SPDLOG_INFO("[Stalker2][UObjectHook] Tracked-object identity validation enabled");
     }
 
     // The Outer Worlds 2: AddObject discovery lands on an unrelated per-object helper whose
@@ -6968,24 +7114,26 @@ void UObjectHook::notify_object_index_freed(sdk::UObjectBase* object) {
 }
 
 bool UObjectHook::install_object_free_hooks() {
-    const auto sites = find_townfall_object_free_sites();
+    const bool stalker2 = is_stalker2_uobjecthook_guard_enabled();
+    const auto tag = stalker2 ? "Stalker2" : "Townfall";
+    const auto sites = stalker2 ? find_stalker2_object_free_sites() : find_townfall_object_free_sites();
 
     for (const auto& site : sites) {
         const auto callback = get_townfall_object_free_callback(site.object_register);
         auto hook = callback != nullptr ? safetyhook::create_mid((void*)site.address, callback) : safetyhook::MidHook{};
 
         if (!hook) {
-            SPDLOG_ERROR("[Townfall][UObjectHook] Failed to hook FreeUObjectIndex site {:x}", site.address);
+            SPDLOG_ERROR("[{}][UObjectHook] Failed to hook FreeUObjectIndex site {:x}", tag, site.address);
             continue;
         }
 
-        SPDLOG_INFO("[Townfall][UObjectHook] Hooked FreeUObjectIndex site {:x} (object in register {})",
-            site.address, site.object_register);
+        SPDLOG_INFO("[{}][UObjectHook] Hooked FreeUObjectIndex site {:x} (object in register {})",
+            tag, site.address, site.object_register);
         m_object_free_hooks.push_back(std::move(hook));
     }
 
     if (m_object_free_hooks.empty()) {
-        SPDLOG_WARN("[Townfall][UObjectHook] No FreeUObjectIndex sites hooked; relying on identity validation");
+        SPDLOG_WARN("[{}][UObjectHook] No FreeUObjectIndex sites hooked; relying on identity validation", tag);
         return false;
     }
 
