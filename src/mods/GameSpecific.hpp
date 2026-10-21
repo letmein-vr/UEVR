@@ -22,6 +22,33 @@ inline std::wstring lowercase_path(std::wstring_view path) {
     return lowered;
 }
 
+inline bool is_minecraft_dungeons_executable_path(std::wstring_view path) {
+    const auto lowered = lowercase_path(path);
+    const auto separator = lowered.find_last_of(L"/\\");
+    const auto filename = std::wstring_view{lowered}.substr(
+        separator == std::wstring::npos ? 0 : separator + 1);
+    return filename == L"dungeons-win64-shipping.exe" ||
+        filename == L"dungeons-wingdk-shipping.exe";
+}
+
+inline bool should_use_minecraft_dungeons_ue561_dedicated_ui_target(
+    std::wstring_view path,
+    std::wstring_view detected_version,
+    uint32_t file_version_ms,
+    uint32_t file_version_ls,
+    bool dx12) {
+    if (!dx12 || !is_minecraft_dungeons_executable_path(path)) {
+        return false;
+    }
+
+    if (!detected_version.empty() && detected_version != L"unknown" &&
+        detected_version != L"0.00" && detected_version != L"5.6") {
+        return detected_version == L"5.6.1" || detected_version.starts_with(L"5.6.1.");
+    }
+
+    return file_version_ms == 0x00050006 && (file_version_ls >> 16) == 1;
+}
+
 inline bool is_dune_ue521_frame_handoff_runtime(
     std::wstring_view path, uint32_t version_ms, uint32_t version_ls) {
     const auto lowered = lowercase_path(path);
@@ -29,6 +56,16 @@ inline bool is_dune_ue521_frame_handoff_runtime(
     const auto filename = std::wstring_view{lowered}.substr(
         separator == std::wstring::npos ? 0 : separator + 1);
     return filename == L"dunesandbox-win64-shipping.exe" &&
+        version_ms == 0x00050002 && version_ls == 0x00010000;
+}
+
+inline bool is_dune_ue521_relocatable_runtime(
+    std::wstring_view path, uint32_t version_ms, uint32_t version_ls) {
+    const auto lowered = lowercase_path(path);
+    const auto separator = lowered.find_last_of(L"/\\");
+    const auto filename = std::wstring_view{lowered}.substr(
+        separator == std::wstring::npos ? 0 : separator + 1);
+    return (filename == L"dunesandbox-win64-shipping.exe" || filename == L"dunesandbox-wingdk-shipping.exe") &&
         version_ms == 0x00050002 && version_ls == 0x00010000;
 }
 
@@ -86,8 +123,11 @@ inline bool is_avowed_executable_path(std::wstring_view path) {
 
 inline bool is_outerworlds2_executable_path(std::wstring_view path) {
     const auto lowered = lowercase_path(path);
-    return lowered.find(L"theouterworlds2-win64-shipping") != std::wstring::npos ||
-           lowered.find(L"theouterworlds2-wingdk-shipping") != std::wstring::npos;
+    const auto separator = lowered.find_last_of(L"/\\");
+    const auto filename = std::wstring_view{lowered}.substr(
+        separator == std::wstring::npos ? 0 : separator + 1);
+    return filename == L"theouterworlds2-win64-shipping.exe" ||
+        filename == L"theouterworlds2-wingdk-shipping.exe";
 }
 
 inline bool is_stalker2_executable_path(std::wstring_view path) {
@@ -342,6 +382,30 @@ inline bool should_use_storm_escape_ue561_native_fix_capture_layout(
     const bool exact_file_version =
         file_version_ms == 0x00050006 && file_version_ls == 0x00010000;
     return exact_detected_version || exact_file_version;
+}
+
+inline bool is_hellraiser_executable_path(std::wstring_view path) {
+    const auto lowered = lowercase_path(path);
+    return lowered == L"hellraiser-win64-shipping.exe" ||
+        lowered.ends_with(L"\\hellraiser-win64-shipping.exe") ||
+        lowered.ends_with(L"/hellraiser-win64-shipping.exe");
+}
+
+inline bool should_use_hellraiser_ue561_native_fix_capture_layout(
+    std::wstring_view path,
+    std::wstring_view detected_version,
+    uint32_t file_version_ms,
+    uint32_t file_version_ls,
+    bool dx12,
+    bool native_stereo,
+    bool native_stereo_fix_active) {
+    if (!dx12 || !native_stereo || !native_stereo_fix_active || !is_hellraiser_executable_path(path)) {
+        return false;
+    }
+    if (!detected_version.empty() && detected_version != L"0.00" && detected_version != L"unknown") {
+        return detected_version == L"5.6.1";
+    }
+    return file_version_ms == 0x00050006 && file_version_ls == 0x00010000;
 }
 
 inline bool is_controller_camera_guard_candidate_path(std::wstring_view path) {

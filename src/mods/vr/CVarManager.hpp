@@ -14,6 +14,8 @@
 
 #include "../../Mod.hpp"
 #include "CVarDiagnostics.hpp"
+#include "Stalker2NativePolicy.hpp"
+#include "SatisfactoryModular.hpp"
 
 // For UE cvars.
 class CVarManager final : public ModComponent {
@@ -29,6 +31,7 @@ public:
 
     void dump_commands();
     void spawn_console();
+    void process_stalker2_sharpen_priority();
 
     void execute_console_script(sdk::UGameEngine* engine, const std::string& filename);
 
@@ -127,6 +130,7 @@ public:
         }
 
     protected:
+        bool update_satisfactory_interface(sdk::IConsoleVariable*& variable);
         uint64_t begin_ui_write(double requested);
         void finish_ui_write(uint64_t request_id, bool callable);
         void load_internal(const std::string& filename, bool set_defaults);
@@ -163,6 +167,7 @@ public:
         bool m_ever_frozen{false};
         uint32_t m_unheld_freeze_sets{0};
         bool m_set_by_escalated{false};
+        uevr::satisfactory::ConsoleRetry m_satisfactory_interface_retry{};
         mutable std::mutex m_write_observation_mutex{};
         uevr::cvar_diagnostics::WriteObservation m_write_observation{};
     };
@@ -237,6 +242,7 @@ private:
 
     std::vector<std::shared_ptr<CVar>> m_displayed_cvars{};
     std::vector<std::shared_ptr<CVar>> m_all_cvars{}; // ones the user can manually add to cvars.txt'
+    uevr::stalker2_native::SharpenPriority m_stalker2_sharpen_priority{};
 
     std::shared_ptr<CVar> m_hzbo{};
 

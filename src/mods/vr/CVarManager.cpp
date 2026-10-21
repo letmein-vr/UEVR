@@ -23,6 +23,8 @@
 
 #include "CVarManager.hpp"
 #include "FrameProfiler.hpp"
+#include "SatisfactoryRuntime.hpp"
+#include "mods/VR.hpp"
 #include "utility/ImGui.hpp"
 #include "utility/Logging.hpp"
 
@@ -33,10 +35,40 @@ constexpr std::string_view cvars_data_txt_name = "cvars_data.txt";
 constexpr std::string_view user_script_txt_name = "user_script.txt";
 
 namespace {
+bool invoke_stalker_flags(void* function, sdk::IConsoleVariable* variable, uint32_t& flags) {
+    __try {
+        flags = reinterpret_cast<uint32_t(__fastcall*)(sdk::IConsoleVariable*)>(function)(variable);
+        return true;
+    } __except(EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
+std::optional<uint32_t> validated_stalker_flags(sdk::IConsoleVariable* variable) {
+    if (!variable || !variable->is_validated_ue55_variable()) { return std::nullopt; }
+    uintptr_t table{}, function{};
+    MEMORY_BASIC_INFORMATION memory{};
+    std::array<uint8_t, 4> code{};
+    SIZE_T read{};
+    const auto read_exact = [&](const void* source, void* destination, size_t size) {
+        return ReadProcessMemory(GetCurrentProcess(), source, destination, size, &read) && read == size;
+    };
+    if (!read_exact(variable, &table, sizeof(table)) ||
+        !read_exact(reinterpret_cast<void*>(table + 3 * sizeof(void*)), &function, sizeof(function)) ||
+        utility::get_module_within(reinterpret_cast<void*>(function)).value_or(nullptr) != utility::get_executable() ||
+        !VirtualQuery(reinterpret_cast<void*>(function), &memory, sizeof(memory)) || memory.State != MEM_COMMIT ||
+        (memory.Protect & (PAGE_GUARD | PAGE_NOACCESS)) ||
+        !(memory.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)) ||
+        !read_exact(reinterpret_cast<void*>(function), code.data(), code.size()) ||
+        !uevr::stalker2_native::flags_accessor(code)) { return std::nullopt; }
+    uint32_t flags{};
+    return invoke_stalker_flags(reinterpret_cast<void*>(function), variable, flags)
+        ? std::optional{flags} : std::nullopt;
+}
+
 int64_t diagnostic_now_ms() {
     return std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now().time_since_epoch()).count();
 }
+
 
 template <typename T>
 std::optional<double> read_raw_cvar_for_diagnostics(sdk::ConsoleVariableDataWrapper* wrapper) {
@@ -522,6 +554,29 @@ bool force_windrose_shadow_runtime_cvars_once(int attempt) {
 }
 }
 
+void CVarManager::process_stalker2_sharpen_priority() {
+    const auto vr = VR::get();
+    if (!vr || !vr->is_stalker2_sharpen_priority_enabled()) { m_stalker2_sharpen_priority = {}; return; }
+    const auto setting = std::find_if(m_all_cvars.begin(), m_all_cvars.end(), [](const auto& cvar) {
+        return cvar->get_name() == L"r.Tonemapper.Sharpen" && cvar->get_type() == CVar::Type::FLOAT && cvar->is_frozen();
+    });
+    if (setting == m_all_cvars.end()) { m_stalker2_sharpen_priority = {}; return; }
+    auto* variable = sdk::find_validated_cvar_cached_only(L"r.Tonemapper.Sharpen");
+    const auto flags = validated_stalker_flags(variable);
+    const auto actual = variable ? variable->TryGetFloat() : std::nullopt;
+    if (!flags || !actual) { m_stalker2_sharpen_priority = {}; return; }
+    const auto requested = (*setting)->get_frozen_float_value();
+    const auto priority = m_stalker2_sharpen_priority.observe(true, reinterpret_cast<uintptr_t>(variable),
+        *flags, requested, *actual);
+    if (!priority) { return; }
+    const auto text = uevr::stalker2_native::float_text(requested);
+    const bool callable = !text.empty() && variable->Set(text.c_str(), *priority);
+    const auto after = variable->TryGetFloat();
+    SPDLOG_INFO_EVERY_N_SEC(2, "[Stalker2][NativeFix][Sharpen] existing_priority=0x{:08x} requested={} before={} after={} callable={} observed={}",
+        *priority, requested, *actual, after.value_or(*actual), callable,
+        after && uevr::stalker2_native::close_float(requested, *after));
+}
+
 CVarManager::CVarManager() {
     ZoneScopedN(__FUNCTION__);
 
@@ -818,6 +873,7 @@ void CVarManager::on_pre_engine_tick(sdk::UGameEngine* engine, float delta) {
             }
         }
     }
+    process_stalker2_sharpen_priority();
 
     m_needs_full_refresh = false;
 
@@ -1518,10 +1574,27 @@ void CVarManager::CVarStandard::freeze() {
     };
 }
 
+bool CVarManager::CVar::update_satisfactory_interface(sdk::IConsoleVariable*& variable) {
+    if (!uevr::satisfactory::is_current_runtime() || !uevr::satisfactory::recover_console_variable(m_name)) {
+        return false;
+    }
+
+    if (variable == nullptr && uevr::satisfactory::console_abi_ready() &&
+        m_satisfactory_interface_retry.begin(diagnostic_now_ms())) {
+        variable = uevr::satisfactory::find_console_variable(m_name, m_type == Type::FLOAT);
+        if (variable == nullptr && m_satisfactory_interface_retry.attempts == uevr::satisfactory::ConsoleRetry::max_attempts) {
+            SPDLOG_WARN("[Satisfactory][CVar] {} interface did not validate; leaving it unavailable without raw-data fallback",
+                utility::narrow(m_name));
+        }
+    }
+    return true;
+}
+
 void CVarManager::CVarStandard::update() {
     ZoneScopedN(__FUNCTION__);
 
     if (m_cvar == nullptr && m_interface_cvar == nullptr) {
+        if (update_satisfactory_interface(m_interface_cvar)) { return; }
         if (is_stalker2_ue55_current_game_for_cvars() || sdk::should_use_ue57_console_manager_interface()) {
             m_interface_fallback_attempted = true;
             m_interface_cvar = sdk::find_validated_console_variable(m_name);
@@ -1785,6 +1858,7 @@ void CVarManager::CVarData::update() {
     ZoneScopedN(__FUNCTION__);
 
     if (!m_cvar_data && m_interface_cvar == nullptr) {
+        if (update_satisfactory_interface(m_interface_cvar)) { return; }
         if (is_stalker2_ue55_current_game_for_cvars() || sdk::should_use_ue57_console_manager_interface()) {
             m_interface_fallback_attempted = true;
             m_interface_cvar = sdk::find_validated_console_variable(m_name);

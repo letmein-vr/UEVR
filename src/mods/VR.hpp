@@ -32,6 +32,8 @@
 #include "vr/CVarManager.hpp"
 
 #include "Mod.hpp"
+#include "vr/SteamFrameInput.hpp"
+#include "vr/GamepadRecovery.hpp"
 
 #undef max
 #include <tracy/Tracy.hpp>
@@ -222,6 +224,18 @@ public:
     static const inline std::string s_action_dpad_down = "/actions/default/in/DPad_Down";
     static const inline std::string s_action_dpad_left = "/actions/default/in/DPad_Left";
     static const inline std::string s_action_system_button = "/actions/default/in/SystemButton";
+    static const inline std::string s_action_bumper = "/actions/default/in/Bumper";
+    static const inline std::string s_action_start_button = "/actions/default/in/StartButton";
+    static const inline std::string s_action_back_button = "/actions/default/in/BackButton";
+    static const inline std::string s_action_trigger_axis = "/actions/default/in/TriggerAxis";
+    static const inline std::string s_action_squeeze = "/actions/default/in/Squeeze";
+    static const inline std::array<std::string, 10> s_touch_actions{
+        "/actions/default/in/TriggerTouch", "/actions/default/in/GripTouch",
+        "/actions/default/in/BumperTouch", "/actions/default/in/JoystickTouch",
+        "/actions/default/in/DPad_UpTouch", "/actions/default/in/DPad_RightTouch",
+        "/actions/default/in/DPad_DownTouch", "/actions/default/in/DPad_LeftTouch",
+        "/actions/default/in/StartButtonTouch", "/actions/default/in/BackButtonTouch"
+    };
     static const inline std::string s_action_thumbrest_touch_left = "/actions/default/in/ThumbrestTouchLeft";
     static const inline std::string s_action_thumbrest_touch_right = "/actions/default/in/ThumbrestTouchRight";
 
@@ -292,7 +306,7 @@ public:
     void on_pre_viewport_client_draw(void* viewport_client, void* viewport, void* canvas) override;
 
     void update_hmd_state(bool from_view_extensions = false, uint32_t frame_count = 0);
-    void update_action_states();
+    void update_action_states(bool from_stalled_xinput = false);
     void update_dpad_gestures();
 
     void reinitialize_renderer() {
@@ -396,6 +410,10 @@ public:
         return false;
     }
     Vector2f get_joystick_axis(vr::VRInputValueHandle_t handle) const;
+    std::string get_controller_profile(vr::VRInputValueHandle_t source) const;
+    const char* get_controller_type(vr::VRInputValueHandle_t source) const;
+    uevr::steam_frame::DigitalInput get_action_state(vr::VRActionHandle_t action, vr::VRInputValueHandle_t source) const;
+    uevr::steam_frame::AnalogInput get_action_axis(vr::VRActionHandle_t action, vr::VRInputValueHandle_t source) const;
 
     vr::VRActionHandle_t get_action_handle(std::string_view action_path) {
         if (auto it = m_action_handles.find(action_path.data()); it != m_action_handles.end()) {
@@ -810,6 +828,11 @@ public:
             m_rendering_method->value() == RenderingMethod::NATIVE_STEREO;
     }
 
+    bool is_stalker2_native_fix_experiment_enabled() const;
+    bool is_stalker2_sharpen_priority_enabled() const {
+        return m_stalker2_sharpen_priority->value() && is_stalker2_native_fix_experiment_enabled();
+    }
+
     bool is_native_stereo_fix_async_openxr_wait_enabled() const {
         const auto runtime = get_runtime();
         return m_native_stereo_fix_async_openxr_wait->value() &&
@@ -847,6 +870,10 @@ public:
         return m_compatibility_ui_layer_pose_stabilizer->value();
     }
 
+    bool is_swgr_bink_seek_budget_enabled() const {
+        return m_compatibility_swgr_bink_seek_budget->value();
+    }
+
     bool is_dune_true_stereo_enabled() const {
         const auto runtime = get_runtime();
         return m_compatibility_dune_true_stereo->value() &&
@@ -878,8 +905,9 @@ public:
     }
 
     bool is_xinput_gamepad_active_within(std::chrono::seconds seconds) const {
-        return m_last_xinput_update.time_since_epoch().count() != 0 &&
-            (std::chrono::steady_clock::now() - m_last_xinput_update) <= seconds;
+        const auto last_update = m_last_xinput_update.load(std::memory_order_relaxed);
+        return last_update.time_since_epoch().count() != 0 &&
+            (std::chrono::steady_clock::now() - last_update) <= seconds;
     }
 
     bool is_controller_camera_conflict_guard_active() const;
@@ -1089,6 +1117,7 @@ private:
 
     bool detect_controllers();
     bool is_any_action_down();
+    bool can_recover_gamepad_input() const;
     void update_shf_auto_2d_mode(sdk::UGameEngine* engine);
     void update_dispatch_auto_2d_mode(sdk::UGameEngine* engine);
     void update_mixtape_auto_2d_mode(sdk::UGameEngine* engine);
@@ -1187,6 +1216,14 @@ private:
     mutable TracyLockable(std::recursive_mutex, m_actions_mtx);
     mutable std::shared_mutex m_rotation_mtx{};
 
+    uevr::steam_frame::DigitalInput read_digital_input(vr::VRActionHandle_t action, vr::VRInputValueHandle_t source) const;
+    uevr::steam_frame::AnalogInput read_trigger_axis(vr::VRInputValueHandle_t source) const;
+    bool is_native_frame_source(vr::VRInputValueHandle_t source) const;
+    bool is_gamepad_shoulder_pressed(vr::VRInputValueHandle_t source) const;
+    uint8_t gamepad_trigger_value(vr::VRInputValueHandle_t source, uint8_t existing) const;
+    void apply_frame_gamepad_input(XINPUT_GAMEPAD& gamepad) const;
+    bool is_gamepad_face_action_active(vr::VRActionHandle_t normal, vr::VRActionHandle_t swapped) const;
+
     std::vector<int32_t> m_controllers{};
     std::unordered_set<int32_t> m_controllers_set{};
 
@@ -1233,6 +1270,12 @@ private:
     vr::VRActionHandle_t m_action_dpad_left{};
 
     vr::VRActionHandle_t m_action_system_button{};
+    vr::VRActionHandle_t m_action_bumper{};
+    vr::VRActionHandle_t m_action_start_button{};
+    vr::VRActionHandle_t m_action_back_button{};
+    vr::VRActionHandle_t m_action_trigger_axis{};
+    vr::VRActionHandle_t m_action_squeeze{};
+    std::array<vr::VRActionHandle_t, 10> m_touch_actions{};
     vr::VRActionHandle_t m_action_haptic{};
     vr::VRActionHandle_t m_action_thumbrest_touch_left{};
     vr::VRActionHandle_t m_action_thumbrest_touch_right{};
@@ -1261,6 +1304,21 @@ private:
         { s_action_dpad_left, m_action_dpad_left },
 
         { s_action_system_button, m_action_system_button },
+        { s_action_bumper, m_action_bumper },
+        { s_action_start_button, m_action_start_button },
+        { s_action_back_button, m_action_back_button },
+        { s_action_trigger_axis, m_action_trigger_axis },
+        { s_action_squeeze, m_action_squeeze },
+        { s_touch_actions[0], m_touch_actions[0] },
+        { s_touch_actions[1], m_touch_actions[1] },
+        { s_touch_actions[2], m_touch_actions[2] },
+        { s_touch_actions[3], m_touch_actions[3] },
+        { s_touch_actions[4], m_touch_actions[4] },
+        { s_touch_actions[5], m_touch_actions[5] },
+        { s_touch_actions[6], m_touch_actions[6] },
+        { s_touch_actions[7], m_touch_actions[7] },
+        { s_touch_actions[8], m_touch_actions[8] },
+        { s_touch_actions[9], m_touch_actions[9] },
         { s_action_thumbrest_touch_left, m_action_thumbrest_touch_left },
         { s_action_thumbrest_touch_right, m_action_thumbrest_touch_right },
 
@@ -1273,14 +1331,16 @@ private:
     vr::VRInputValueHandle_t m_right_joystick{};
 
     std::chrono::steady_clock::time_point m_last_controller_update{};
-    std::chrono::steady_clock::time_point m_last_xinput_update{};
-    std::chrono::steady_clock::time_point m_last_xinput_spoof_sent{};
+    std::atomic<std::chrono::steady_clock::time_point> m_last_xinput_update{};
+    std::atomic<std::chrono::steady_clock::time_point> m_last_xinput_spoof_sent{};
     std::chrono::steady_clock::time_point m_last_xinput_l3_r3_menu_open{};
     std::chrono::steady_clock::time_point m_last_interaction_display{};
-    std::chrono::steady_clock::time_point m_last_engine_tick{};
+    std::atomic<std::chrono::steady_clock::time_point> m_last_engine_tick{};
     std::chrono::steady_clock::time_point m_last_mod_frame{};
     std::chrono::steady_clock::time_point m_last_tick_gap_log{};
     std::atomic_bool m_has_observed_xinput{false};
+    std::mutex m_gamepad_recovery_mtx{};
+    uevr::input_recovery::GamepadRecovery m_gamepad_recovery{}; // protected by m_gamepad_recovery_mtx
 
     struct UILayerPoseTelemetrySnapshot {
         uint64_t sample_count{};
@@ -1427,7 +1487,7 @@ private:
     std::atomic<uint32_t> m_stalker2_transition_stress_events{0};
     std::atomic<uint32_t> m_stalker2_transition_deferred_frames{0};
 
-    uint32_t m_lowest_xinput_user_index{};
+    std::atomic_uint32_t m_lowest_xinput_user_index{};
 
     std::chrono::nanoseconds m_last_input_delay{};
     std::chrono::nanoseconds m_avg_input_delay{};
@@ -1705,6 +1765,8 @@ private:
     const ModToggle::Ptr m_native_stereo_fix_preserve_secondary_pass{ ModToggle::create(generate_name("NativeStereoFixPreserveSecondaryPass"), true) };
     const ModToggle::Ptr m_native_stereo_fix_texture_array_submit{ ModToggle::create(generate_name("NativeStereoFixTextureArraySubmit"), false) };
     const ModToggle::Ptr m_native_stereo_fix_async_openxr_wait{ ModToggle::create(generate_name("NativeStereoFixAsyncOpenXRWait"), false) };
+    const ModToggle::Ptr m_stalker2_native_pair_experiment{ ModToggle::create(generate_name("Stalker2NativePairExperiment"), false) };
+    const ModToggle::Ptr m_stalker2_sharpen_priority{ ModToggle::create(generate_name("Stalker2SharpenExistingPriority"), false) };
 
     const ModSlider::Ptr m_custom_z_near{ ModSlider::create(generate_name("CustomZNear"), 0.001f, 100.0f, 0.01f, true) };
     const ModToggle::Ptr m_custom_z_near_enabled{ ModToggle::create(generate_name("EnableCustomZNear"), false, true) };
@@ -1723,6 +1785,10 @@ private:
     const ModToggle::Ptr m_compatibility_head_turn_camera_stabilizer{ ModToggle::create(generate_name("Compatibility_HeadTurnCameraStabilizer"), false, true) };
     const ModToggle::Ptr m_compatibility_ui_layer_pose_telemetry{ ModToggle::create(generate_name("Compatibility_UILayerPoseTelemetry"), false, true) };
     const ModToggle::Ptr m_compatibility_ui_layer_pose_stabilizer{ ModToggle::create(generate_name("Compatibility_UILayerPoseStabilizer"), false, true) };
+    const ModToggle::Ptr m_compatibility_swgr_bink_seek_budget{ ModToggle::create(generate_name("Compatibility_SWGRBinkSeekBudget"), false, true) };
+    const ModToggle::Ptr m_compatibility_swgr_disable_panini{ ModToggle::create(generate_name("Compatibility_SWGRDisablePanini"), false, true) };
+    const ModToggle::Ptr m_compatibility_swgr_panini_component{ ModToggle::create(generate_name("Compatibility_SWGRPaniniComponentFallback"), false, true) };
+    const ModToggle::Ptr m_compatibility_swgr_letterboxing{ ModToggle::create(generate_name("Compatibility_SWGRLetterboxingFix"), false, true) };
     const ModToggle::Ptr m_compatibility_fullscreen_16x9_cameras{ ModToggle::create(generate_name("Compatibility_Fullscreen16x9Cameras"), false, true) };
     const ModSlider::Ptr m_compatibility_fullscreen_16x9_camera_aspect{ ModSlider::create(generate_name("Compatibility_Fullscreen16x9CameraAspect"), 0.0f, 4.0f, 0.0f, true) };
     const ModToggle::Ptr m_compatibility_subnautica2_native_water{ ModToggle::create(generate_name("Compatibility_Subnautica2NativeWater"), false, true) };
@@ -2022,6 +2088,8 @@ public:
             *m_native_stereo_fix_preserve_secondary_pass,
             *m_native_stereo_fix_texture_array_submit,
             *m_native_stereo_fix_async_openxr_wait,
+            *m_stalker2_native_pair_experiment,
+            *m_stalker2_sharpen_priority,
             *m_splitscreen_compatibility_mode,
             *m_splitscreen_view_index,
             *m_compatibility_skip_pip,
@@ -2032,6 +2100,10 @@ public:
             *m_compatibility_head_turn_camera_stabilizer,
             *m_compatibility_ui_layer_pose_telemetry,
             *m_compatibility_ui_layer_pose_stabilizer,
+            *m_compatibility_swgr_bink_seek_budget,
+            *m_compatibility_swgr_disable_panini,
+            *m_compatibility_swgr_panini_component,
+            *m_compatibility_swgr_letterboxing,
             *m_compatibility_fullscreen_16x9_cameras,
             *m_compatibility_fullscreen_16x9_camera_aspect,
             *m_compatibility_subnautica2_native_water,
@@ -2150,7 +2222,7 @@ private:
     bool m_backbuffer_inconsistency{false};
     bool m_init_finished{false};
     bool m_has_hw_scheduling{false}; // hardware accelerated GPU scheduling
-    bool m_spoofed_gamepad_connection{false};
+    std::atomic_bool m_spoofed_gamepad_connection{false};
     bool m_aim_temp_disabled{false};
     bool m_subnautica2_save_thumbnail_guard_done{false};
     bool m_subnautica2_save_thumbnail_fallback_logged{false};
@@ -2293,6 +2365,7 @@ private:
     static std::string actions_json;
     static std::string binding_rift_json;
     static std::string bindings_oculus_touch_json;
+    static std::string bindings_frame_controller_json;
     static std::string binding_vive;
     static std::string bindings_vive_controller;
     static std::string bindings_knuckles;
@@ -2301,6 +2374,7 @@ private:
         { "actions.json", actions_json },
         { "binding_rift.json", binding_rift_json },
         { "bindings_oculus_touch.json", bindings_oculus_touch_json },
+        { "bindings_frame_controller.json", bindings_frame_controller_json },
         { "binding_vive.json", binding_vive },
         { "bindings_vive_controller.json", bindings_vive_controller },
         { "bindings_knuckles.json", bindings_knuckles }
