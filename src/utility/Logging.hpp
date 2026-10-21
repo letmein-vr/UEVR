@@ -58,6 +58,16 @@ inline bool should_log_every_n_seconds(
     } \
 } while (false)
 
+// SPDLOG_DEBUG is compiled out (SPDLOG_ACTIVE_LEVEL is INFO); this stays available at runtime
+// when the Log Level option is set to Debug.
+#define SPDLOG_DEBUG_EVERY_N_SEC(n, ...) do { \
+    static std::atomic<int64_t> last_log_nanoseconds{0}; \
+    if (spdlog::should_log(spdlog::level::debug) && \
+        ::utility::logging::detail::should_log_every_n_seconds(last_log_nanoseconds, std::chrono::seconds(n))) { \
+        SPDLOG_LOGGER_CALL(spdlog::default_logger_raw(), spdlog::level::debug, __VA_ARGS__); \
+    } \
+} while (false)
+
 #define SPDLOG_WARNING_EVERY_N_SEC(n, ...) do { \
     static std::atomic<int64_t> last_log_nanoseconds{0}; \
     if (::utility::logging::detail::should_log_every_n_seconds(last_log_nanoseconds, std::chrono::seconds(n))) { \

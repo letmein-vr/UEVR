@@ -2880,7 +2880,7 @@ void UObjectHook::tick_attachments(Rotator<float>* view_rotation, const float wo
             m_stalker2_lazy_stats.stale_attachment_prunes.fetch_add(
                 stale_attachment_prunes,
                 std::memory_order_relaxed);
-            SPDLOG_INFO_EVERY_N_SEC(
+            SPDLOG_DEBUG_EVERY_N_SEC(
                 2,
                 "[Stalker2][UObjectHook] Pruned {} stale motion-controller attachment identities during world transition",
                 stale_attachment_prunes);
