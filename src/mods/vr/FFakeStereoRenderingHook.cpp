@@ -5941,6 +5941,19 @@ bool stalker2_uses_validated_ue55_native_fix_capture_layout() {
            vr != nullptr && vr->is_native_stereo_fix_enabled();
 }
 
+// The Outer Worlds 2 renders the right eye through the same legacy two-render path and shows the
+// Stalker 2 one-frame lag refusals (delta 2/2) that keyed packets resolve.
+bool outerworlds2_uses_keyed_native_packets() {
+    static const bool exact_runtime = []() {
+        const auto exe_path = utility::get_module_pathw(utility::get_executable());
+        return exe_path && uevr::games::is_outerworlds2_executable_path(*exe_path);
+    }();
+
+    const auto vr = VR::get();
+    return exact_runtime && g_framework != nullptr && g_framework->is_dx12() &&
+           vr != nullptr && vr->is_native_stereo_fix_enabled();
+}
+
 bool bodycam_uses_validated_ue554_native_fix_capture_layout() {
     const auto vr = VR::get();
     return bodycam_ue554_is_current_game() &&
@@ -27393,7 +27406,7 @@ bool FFakeStereoRenderingHook::uses_native_last_pair_fallback() const {
 bool FFakeStereoRenderingHook::uses_frame_keyed_native_packets() const {
     // The key is only meaningful when VR::m_frame_count at Present comes from the RHI-ordered
     // command-list pose handoff; the Slate/direct fallbacks set it from the render thread.
-    return stalker2_uses_validated_ue55_native_fix_capture_layout() &&
+    return (stalker2_uses_validated_ue55_native_fix_capture_layout() || outerworlds2_uses_keyed_native_packets()) &&
         m_has_successful_command_list_hijack &&
         SceneViewExtensionAnalyzer::frame_count_offset != 0;
 }
