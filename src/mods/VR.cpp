@@ -45,6 +45,7 @@
 
 #include <tracy/Tracy.hpp>
 #include "utility/SupportDiagnostics.hpp"
+#include "utility/ConcurrentInlineHook.hpp"
 
 #include "Framework.hpp"
 #include "FrameProfiler.hpp"
@@ -64,6 +65,7 @@
 namespace {
 bool is_stalker2_executable_cached();
 bool is_dune_awakening_executable_cached();
+bool is_avowed_executable();
 }
 
 NVSDK_NGX_Result hk_NVSDK_NGX_D3D12_CreateFeature(
@@ -209,9 +211,17 @@ NVSDK_NGX_Result hk_NVSDK_NGX_D3D12_EvaluateFeature(
 
 //decltype(&ID3D12GraphicsCommandList::ResourceBarrier) ptrResourceBarrier; // 26
 static SafetyHookInline ResourceBarrier_Hook{};
+// Avowed: SafetyHook's call() holds the hook mutex across the original, so every render thread's
+// barriers queued behind one lock while the AFW hooks were installed.
+static utility::ConcurrentInlineHook ResourceBarrier_ConcurrentHook{};
 void WINAPI hk_ID3D12GraphicsCommandList_ResourceBarrier(ID3D12GraphicsCommandList* This, UINT NumBarriers, const D3D12_RESOURCE_BARRIER* pBarriers) {
     //(This->*ptrResourceBarrier)(NumBarriers, pBarriers);
-    ResourceBarrier_Hook.call(This, NumBarriers, pBarriers);
+    if (const auto lease = ResourceBarrier_ConcurrentHook.acquire()) {
+        using ResourceBarrierFn = void (WINAPI*)(ID3D12GraphicsCommandList*, UINT, const D3D12_RESOURCE_BARRIER*);
+        lease->original<ResourceBarrierFn>()(This, NumBarriers, pBarriers);
+    } else {
+        ResourceBarrier_Hook.call(This, NumBarriers, pBarriers);
+    }
     const auto& vr = VR::get();
 
     // Only track barriers submitted in RHISubmissionThread
@@ -339,15 +349,28 @@ void WINAPI hk_ID3D12Device_CreateDepthStencilView(
 
 //decltype(&ID3D12GraphicsCommandList::ClearDepthStencilView) ptrClearDepthStencilView; // 47
 static SafetyHookInline ClearDepthStencilView_Hook{};
-void WINAPI hk_ID3D12GraphicsCommandList_ClearDepthStencilView(ID3D12GraphicsCommandList* This, 
+static utility::ConcurrentInlineHook ClearDepthStencilView_ConcurrentHook{};
+void WINAPI hk_ID3D12GraphicsCommandList_ClearDepthStencilView(ID3D12GraphicsCommandList* This,
     D3D12_CPU_DESCRIPTOR_HANDLE DepthStencilView, D3D12_CLEAR_FLAGS ClearFlags, FLOAT Depth, UINT8 Stencil, UINT NumRects, const D3D12_RECT* pRects) {
 
     //(This->*ptrClearDepthStencilView)(DepthStencilView, ClearFlags, Depth, Stencil, NumRects, pRects);
-    ClearDepthStencilView_Hook.call(This, DepthStencilView, ClearFlags, Depth, Stencil, NumRects, pRects);
+    if (const auto lease = ClearDepthStencilView_ConcurrentHook.acquire()) {
+        using ClearDepthStencilViewFn = void (WINAPI*)(ID3D12GraphicsCommandList*, D3D12_CPU_DESCRIPTOR_HANDLE,
+            D3D12_CLEAR_FLAGS, FLOAT, UINT8, UINT, const D3D12_RECT*);
+        lease->original<ClearDepthStencilViewFn>()(This, DepthStencilView, ClearFlags, Depth, Stencil, NumRects, pRects);
+    } else {
+        ClearDepthStencilView_Hook.call(This, DepthStencilView, ClearFlags, Depth, Stencil, NumRects, pRects);
+    }
 
     const auto& vr = VR::get();
 
     if (ClearFlags != D3D12_CLEAR_FLAG_STENCIL || !vr->is_hmd_active())
+        return;
+
+    // Avowed: this is a hot engine path. With another rendering method selected nothing consumes the
+    // depth copy below, yet it was still issued into the game's command list in Native after an AFW
+    // switch. (Not is_using_afw: with DLSS off this is AFW's depth source during its settle frames.)
+    if (is_avowed_executable() && !vr->is_afw_rendering_method_selected())
         return;
 
     auto render_frame_count = vr->get_render_frame_count();
@@ -3264,19 +3287,35 @@ void VR::initialize_afw() try {
         auto origResourceBarrier = pVTable[26];
         auto origClearDepthStencilView = pVTable[47];
 
-        auto result = safetyhook::InlineHook::create((LPVOID)origResourceBarrier, reinterpret_cast<void*>(hk_ID3D12GraphicsCommandList_ResourceBarrier));
-        if (!result) {
-            spdlog::error("Hook ID3D12GraphicsCommandList ResourceBarrier Failed! {}", (INT)result.error().type);
-            return;
-        }
-        ResourceBarrier_Hook = std::move(result.value());
+        if (is_avowed_executable()) {
+            if (const auto error = ResourceBarrier_ConcurrentHook.install(
+                    (void*)origResourceBarrier, reinterpret_cast<void*>(hk_ID3D12GraphicsCommandList_ResourceBarrier))) {
+                spdlog::error("[Avowed] Hook ID3D12GraphicsCommandList ResourceBarrier failed: {}", *error);
+                return;
+            }
 
-        result = safetyhook::InlineHook::create((LPVOID)origClearDepthStencilView, reinterpret_cast<void*>(hk_ID3D12GraphicsCommandList_ClearDepthStencilView));
-        if (!result) {
-            spdlog::error("Hook ID3D12GraphicsCommandList ClearDepthStencilView Failed! {}", (INT)result.error().type);
-            return;
+            if (const auto error = ClearDepthStencilView_ConcurrentHook.install(
+                    (void*)origClearDepthStencilView, reinterpret_cast<void*>(hk_ID3D12GraphicsCommandList_ClearDepthStencilView))) {
+                spdlog::error("[Avowed] Hook ID3D12GraphicsCommandList ClearDepthStencilView failed: {}", *error);
+                return;
+            }
+
+            spdlog::info("[Avowed] ResourceBarrier/ClearDepthStencilView hooked without a call-time lock");
+        } else {
+            auto result = safetyhook::InlineHook::create((LPVOID)origResourceBarrier, reinterpret_cast<void*>(hk_ID3D12GraphicsCommandList_ResourceBarrier));
+            if (!result) {
+                spdlog::error("Hook ID3D12GraphicsCommandList ResourceBarrier Failed! {}", (INT)result.error().type);
+                return;
+            }
+            ResourceBarrier_Hook = std::move(result.value());
+
+            result = safetyhook::InlineHook::create((LPVOID)origClearDepthStencilView, reinterpret_cast<void*>(hk_ID3D12GraphicsCommandList_ClearDepthStencilView));
+            if (!result) {
+                spdlog::error("Hook ID3D12GraphicsCommandList ClearDepthStencilView Failed! {}", (INT)result.error().type);
+                return;
+            }
+            ClearDepthStencilView_Hook = std::move(result.value());
         }
-        ClearDepthStencilView_Hook = std::move(result.value());
     }
     //*(uintptr_t*)&ptrResourceBarrier = hookVtable(cmdList, 26, hk_ID3D12GraphicsCommandList_ResourceBarrier);
     //*(uintptr_t*)&ptrClearDepthStencilView = hookVtable(cmdList, 47, hk_ID3D12GraphicsCommandList_ClearDepthStencilView);

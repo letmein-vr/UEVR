@@ -4281,9 +4281,36 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
     auto otherEyeFrameBuffer = m_eyeFrameBuffers.eyeFrameBuffers[nEyeOther];
     FrameWarpEvaluateParams params;
 
+    // Avowed: setup_d3d12 skips InitFrameWarp while the 2D screen is active, which it is at injection
+    // in the menus, so AFW can be selected before any eye frame buffer exists. The block below then
+    // dereferenced the missing buffer (CTD on injection). Render plain AFR until they are allocated,
+    // and only ask for a reset when the next setup will actually allocate them.
+    bool frame_warp_buffers_missing = false;
+    if (is_avowed_current_game() &&
+        (eyeFrameBuffer.color.pTexture == nullptr || otherEyeFrameBuffer.color.pTexture == nullptr)) {
+        frame_warp_buffers_missing = true;
+
+        if (is_using_afw) {
+            SPDLOG_INFO_EVERY_N_SEC(5, "[Avowed][AFW] Frame warp buffers not allocated yet (2D screen={}); rendering plain AFR",
+                vr->is_using_2d_screen());
+            is_using_afw = false;
+
+            if (!vr->is_using_2d_screen()) {
+                force_reset();
+            }
+        }
+    }
+
+    // Avowed: once the renderer exists (AFW selected at some point this session) this block used to
+    // run every frame in Native as well: depth/descriptor setup and a submitted command list nothing
+    // consumes. Keep the renderer for a live switch back, but do no plugin work while another
+    // rendering method is selected. (Not is_using_afw: during AFW's settle frames this block still
+    // has to allocate the depth/motion-vector targets the DLSS hook fills.)
+    const bool frame_warp_inactive = is_avowed_current_game() && !vr->is_afw_rendering_method_selected();
+
     // The frame warp renderer only exists when AFW was the selected rendering
     // method at init (see VR::clean_initialize); skip all plugin work otherwise.
-    if (vr->d3d12Renderer != nullptr) {
+    if (vr->d3d12Renderer != nullptr && !frame_warp_buffers_missing && !frame_warp_inactive) {
     const auto bb_desc = backbuffer->GetDesc();
     const auto eye_width = static_cast<uint32_t>(bb_desc.Width / 2);
     const auto eye_height = static_cast<uint32_t>(bb_desc.Height);

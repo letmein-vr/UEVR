@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <cstdio>
 #include <fstream>
+#include <mutex>
 #include <vector>
 
 #include <utility/Logging.hpp>
@@ -60,6 +61,7 @@
 #include "vr/KtjLHookContracts.hpp"
 #include "utility/UObjectAllocatorDiscovery.hpp"
 #include "utility/HookDiagnostics.hpp"
+#include "FrameProfiler.hpp"
 
 //#define VERBOSE_UOBJECTHOOK
 
@@ -75,6 +77,28 @@ constexpr size_t STALKER2_PERSISTENT_STATE_RESOLVE_BUDGET = 8;
 constexpr size_t STALKER2_PERSISTENT_PROPERTY_RESOLVE_BUDGET = 4;
 constexpr size_t STALKER2_CLASS_BROWSER_CLASS_CAP = 256;
 constexpr size_t STALKER2_CLASS_BROWSER_OBJECT_CAP = 128;
+
+bool seh_read(uintptr_t address, void* output, size_t size) {
+    if (address < 0x10000 || size > UINTPTR_MAX - address) {
+        return false;
+    }
+
+    __try {
+        std::memcpy(output, reinterpret_cast<const void*>(address), size);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+// Plain reads under SEH, for the creation path: a ReadProcessMemory call per field would cost more
+// than registering the object, and a level load creates hundreds of thousands of them.
+const sdk::discovery::Memory g_seh_memory{nullptr,
+    [](void*, uintptr_t address, void* output, size_t size) { return seh_read(address, output, size); }, nullptr};
+
+// GUObjectArray, set before the OW2 creation hooks are enabled: FUObjectArray::AllocateUObjectIndex
+// is called on it (rcx), which tells its calls apart from StaticAllocateObject's.
+std::atomic<uintptr_t> g_creation_object_array{};
 
 bool is_uobject_array_member(sdk::UObjectBase* object);
 
@@ -545,11 +569,22 @@ bool should_tick_motion_controller_attachments_for_view(int32_t view_index, bool
     }
 
     auto& vr = VR::get();
-    if (view_index != 0 ||
-        !is_double ||
-        !vr->is_using_synchronized_afr() ||
-        vr->is_sceneview_compatibility_enabled() ||
-        !is_ue_5_5_or_newer_uobjecthook())
+
+    // Avowed (UE 5.3): AFW falls back to synchronized AFR while the 2D screen is up, which the profile
+    // turns on for every level load, and only raw view_index 0 arrives there. Attachments (the motion
+    // controller components and the HMD component) then never ticked until the 2D screen went away; the
+    // profile moved the camera to the unplaced right controller, World Partition streamed around the
+    // world origin and the player fell through the map. Native stereo computes both views, so it ticked.
+    const auto avowed_synced_view_zero =
+        is_avowed_uobjecthook_guard_enabled() && view_index == 0 && vr->is_using_synchronized_afr() &&
+        !vr->is_sceneview_compatibility_enabled();
+
+    if (!avowed_synced_view_zero &&
+        (view_index != 0 ||
+         !is_double ||
+         !vr->is_using_synchronized_afr() ||
+         vr->is_sceneview_compatibility_enabled() ||
+         !is_ue_5_5_or_newer_uobjecthook()))
     {
         return false;
     }
@@ -559,6 +594,12 @@ bool should_tick_motion_controller_attachments_for_view(int32_t view_index, bool
 
     if ((frame_count % 2) != 1) {
         return false;
+    }
+
+    if (avowed_synced_view_zero) {
+        SPDLOG_INFO_ONCE("[Avowed][SyncedSequential][MotionController] Treating raw view_index 0 as the right-eye attachment update (double={}, 2D screen={})",
+            is_double, vr->is_using_2d_screen());
+        return true;
     }
 
     SPDLOG_INFO_ONCE("[SyncedSequential][MotionController] Treating UE5.5+ raw view_index 0 as the right-eye attachment update");
@@ -804,6 +845,108 @@ bool is_safe_uobject_candidate(UObjectHook& hook, sdk::UObjectBase* object, bool
     }
 
     return is_probably_uobject_layout(cls);
+}
+
+// Avowed (UE 5.3): AllocateUObjectIndex is inlined into three functions, so there is no AddObject to hook,
+// and objects the game creates (e.g. AddComponentByClass from Lua) only reached the class lists through
+// the slow array scan. The engine still calls each FUObjectCreateListener in GUObjectArray right after it
+// registers an object: vtable slot 1, NotifyUObjectCreated(Object, Index), outside ObjObjectsCritical.
+class AvowedCreateListener {
+public:
+    virtual ~AvowedCreateListener() = default;
+
+    virtual void notify_uobject_created(sdk::UObjectBase* object, int32_t) {
+        UObjectHook::notify_object_created(object);
+    }
+
+    // The engine expects each listener to remove itself here.
+    virtual void on_uobject_array_shutdown();
+};
+
+struct UObjectPointerArray {
+    uintptr_t* data;
+    int32_t num;
+    int32_t max;
+};
+
+// FUObjectArray (5.3): ObjObjects +0x10 (NumElements +0x24), ObjObjectsCritical +0x30, ObjAvailableList +0x58,
+// UObjectCreateListeners +0x68, UObjectDeleteListeners +0x78 (read from the inlined AllocateUObjectIndex loop).
+constexpr uintptr_t AVOWED_CREATE_LISTENERS_OFFSET = 0x68;
+constexpr uintptr_t AVOWED_DELETE_LISTENERS_OFFSET = 0x78;
+
+AvowedCreateListener g_avowed_create_listener{};
+UObjectPointerArray* g_avowed_create_listeners{};
+
+void AvowedCreateListener::on_uobject_array_shutdown() {
+    auto* listeners = g_avowed_create_listeners;
+
+    if (listeners == nullptr) {
+        return;
+    }
+
+    for (int32_t i = listeners->num - 1; i >= 0; --i) {
+        if (listeners->data[i] == (uintptr_t)this) {
+            listeners->data[i] = listeners->data[listeners->num - 1];
+            --listeners->num;
+            break;
+        }
+    }
+}
+
+bool is_plausible_listener_array(const UObjectPointerArray& array) {
+    if (array.num < 0 || array.max < array.num || array.max > 256) {
+        return false;
+    }
+
+    return array.max == 0 ? array.data == nullptr : array.data != nullptr && !IsBadReadPtr(array.data, array.max * sizeof(uintptr_t));
+}
+
+bool register_avowed_create_listener() try {
+    const auto object_array = (uintptr_t)sdk::FUObjectArray::get();
+
+    if (object_array == 0) {
+        SPDLOG_ERROR("[Avowed][UObjectHook] No GUObjectArray; cannot register a create listener");
+        return false;
+    }
+
+    auto* create_listeners = (UObjectPointerArray*)(object_array + AVOWED_CREATE_LISTENERS_OFFSET);
+    const auto* delete_listeners = (UObjectPointerArray*)(object_array + AVOWED_DELETE_LISTENERS_OFFSET);
+
+    if (!is_plausible_listener_array(*create_listeners) || !is_plausible_listener_array(*delete_listeners)) {
+        SPDLOG_ERROR("[Avowed][UObjectHook] GUObjectArray listener arrays do not match the 5.3 layout (create {}/{}, delete {}/{})",
+            create_listeners->num, create_listeners->max, delete_listeners->num, delete_listeners->max);
+        return false;
+    }
+
+    if (create_listeners->num == create_listeners->max) {
+        // Readers iterate without a lock, so the array can't be reallocated under them; allocating with
+        // GMalloc keeps it valid if the engine grows it later. An empty array has nothing to move.
+        auto* malloc = sdk::FMalloc::get();
+        uintptr_t* data = malloc != nullptr && create_listeners->num == 0 ? (uintptr_t*)malloc->malloc(4 * sizeof(uintptr_t), 0) : nullptr;
+
+        if (data == nullptr) {
+            SPDLOG_ERROR("[Avowed][UObjectHook] Cannot grow the create-listener array ({} entries)", create_listeners->num);
+            return false;
+        }
+
+        data[0] = (uintptr_t)&g_avowed_create_listener;
+        create_listeners->data = data;
+        create_listeners->max = 4;
+        std::atomic_thread_fence(std::memory_order_release);
+        create_listeners->num = 1;
+    } else {
+        create_listeners->data[create_listeners->num] = (uintptr_t)&g_avowed_create_listener;
+        std::atomic_thread_fence(std::memory_order_release);
+        ++create_listeners->num;
+    }
+
+    g_avowed_create_listeners = create_listeners;
+    SPDLOG_INFO("[Avowed][UObjectHook] Registered FUObjectCreateListener at GUObjectArray+0x{:x} ({} listener(s))",
+        AVOWED_CREATE_LISTENERS_OFFSET, create_listeners->num);
+    return true;
+} catch (...) {
+    SPDLOG_ERROR("[Avowed][UObjectHook] Registering the create listener faulted");
+    return false;
 }
 
 bool ktjl_registered_header(uintptr_t address, sdk::ktjl::ObjectHeader& header) {
@@ -1182,10 +1325,21 @@ void UObjectHook::hook() {
     // and deferred registration call the same FUObjectArray allocator instead.
     // OW2's backup resolver can select an unrelated helper. Do not discover or
     // hook it; keep destructor tracking and the validated object-array fallback.
-    auto add_object_fn = (goweday || is_outerworlds2_uobjecthook()) ? std::optional<uintptr_t>{} :
+    // Avowed's 2026-10-26 build inlines AllocateUObjectIndex into three functions; the generic
+    // resolver picked an unrelated TArray shrink helper instead. Skip it; plugin-facing objects are
+    // adopted on demand (exists_or_track_plugin_object) on top of the array scan.
+    auto add_object_fn = (goweday || is_outerworlds2_uobjecthook() || is_avowed_uobjecthook_guard_enabled()) ? std::optional<uintptr_t>{} :
         is_townfall_ue56_uobjecthook() ? find_townfall_object_allocator() : sdk::UObjectBase::get_add_object();
     if (is_outerworlds2_uobjecthook()) {
-        SPDLOG_INFO("[OW2][UObjectHook] Skipping AddObject discovery; using validated array tracking with a 4 ms soft tick budget");
+        SPDLOG_INFO("[OW2][UObjectHook] Skipping AddObject discovery (the resolver selects an unrelated helper)");
+    }
+    if (is_avowed_uobjecthook_guard_enabled()) {
+        if (m_creation_tracking->value()) {
+            SPDLOG_INFO("[Avowed][UObjectHook] Skipping AddObject discovery; tracking creation through a GUObjectArray create listener");
+            m_creation_tracking_active.store(register_avowed_create_listener(), std::memory_order_release);
+        } else {
+            SPDLOG_INFO("[Avowed][UObjectHook] Skipping AddObject discovery; creation tracking is off, using FUObjectArray scanning");
+        }
     }
     if (is_townfall_ue56_uobjecthook() && !add_object_fn) {
         SPDLOG_WARN("[Townfall][UObjectHook] Allocator evidence changed; using existing array-tracking fallback");
@@ -1273,6 +1427,12 @@ void UObjectHook::hook() {
         // check each lookup against the FUObjectArray slot.
         m_validate_tracked_identity.store(true, std::memory_order_relaxed);
         SPDLOG_INFO("[Stalker2][UObjectHook] Tracked-object identity validation enabled");
+    } else if (is_avowed_uobjecthook_guard_enabled()) {
+        // Avowed: ~UObjectBase is inlined into every destructor, so discovery falls back to UObject's own
+        // destructor, which only exact-UObject instances reach. Nothing else is ever untracked, and after a
+        // level change exists() passed for freed components (Lua then faulted reading them).
+        m_validate_tracked_identity.store(true, std::memory_order_relaxed);
+        SPDLOG_INFO("[Avowed][UObjectHook] Tracked-object identity validation enabled");
     }
 
     if (!m_destructor_hook && !m_goweday_object_free_hook && !stalker2_object_free_sites) {
@@ -1334,11 +1494,25 @@ void UObjectHook::hook() {
         }
     }
 
+    if (is_outerworlds2_uobjecthook()) {
+        if (m_creation_tracking->value()) {
+            m_creation_tracking_active.store(hook_outerworlds2_creation_functions(), std::memory_order_release);
+        } else {
+            SPDLOG_INFO("[OW2][UObjectHook] Creation tracking is off; using FUObjectArray scanning");
+        }
+    }
+
+    const bool creation_tracking = m_creation_tracking_active.load(std::memory_order_acquire);
+
     m_hooked.store(true, std::memory_order_release);
-    m_force_uobject_array_creation_scan.store(!m_add_object_hooked.load(std::memory_order_acquire), std::memory_order_relaxed);
+    // Creation tracking sees every object the scan would find, so the scan would only repeat its work.
+    m_force_uobject_array_creation_scan.store(!m_add_object_hooked.load(std::memory_order_acquire) && !creation_tracking,
+        std::memory_order_relaxed);
 
     if (m_add_object_hooked) {
         SPDLOG_INFO("[UObjectHook] Hooked UObjectBase");
+    } else if (creation_tracking) {
+        SPDLOG_INFO("[UObjectHook] Hooked UObjectBase destructor; tracking objects at creation, FUObjectArray scanning off");
     } else if (!goweday) {
         SPDLOG_INFO("[UObjectHook] Hooked UObjectBase destructor; AddObject creation tracking is using FUObjectArray scanning");
     }
@@ -1371,6 +1545,12 @@ void UObjectHook::hook() {
             auto object = uobjectarray->get_object(i);
 
             if (object == nullptr || object->get_object() == nullptr) {
+                continue;
+            }
+
+            // With creation tracking, the existing objects take the same cheap path as new ones.
+            if (creation_tracking) {
+                adopt_created_object(object->get_object(), true);
                 continue;
             }
 
@@ -1729,7 +1909,7 @@ bool UObjectHook::add_new_object(sdk::UObjectBase* object, bool run_creation_job
         return false;
     }
 
-    std::vector<std::function<void(sdk::UObject*)>> creation_jobs;
+    CreationJobs creation_jobs;
     const auto object_array = sdk::FUObjectArray::get();
     const auto identity = sdk::observe_uobject(object);
     if (!object_array || !identity) { return false; }
@@ -1753,6 +1933,8 @@ bool UObjectHook::add_new_object(sdk::UObjectBase* object, bool run_creation_job
     meta->uclass = c;
     meta->identity = identity->identity;
     meta->full_name = object->get_full_name();
+    meta->name_pending = false;
+    meta->class_identity = false;
     meta->is_default = (object->get_object_flags() & 0x10u) != 0;
     meta->super_classes.reserve(16);
     size_t chain_index{};
@@ -1771,12 +1953,24 @@ bool UObjectHook::add_new_object(sdk::UObjectBase* object, bool run_creation_job
         reinterpret_cast<uintptr_t>(object_array), sdk::FUObjectArray::get_layout(),
         reinterpret_cast<uintptr_t>(object), header->index, header->packed_index, header);
     if (exists_unsafe(object) || !current || !sdk::object_liveness::matches(meta->identity, current->identity)) { return false; }
+    const auto observed_identity = meta->identity;
+    const auto generation = publish_object_locked(object, std::move(meta), run_creation_jobs, creation_jobs);
+    lock.unlock();
+
+    if (!creation_jobs.empty()) {
+        enqueue_creation_jobs(object, generation, observed_identity, std::move(creation_jobs));
+    }
+    return true;
+}
+
+// No published membership until every name/class/identity read has completed (callers hold the
+// unique lock). Roll back container insertions too if allocation fails part way through.
+uint64_t UObjectHook::publish_object_locked(sdk::UObjectBase* object, std::unique_ptr<MetaObject> meta,
+    bool run_creation_jobs, CreationJobs& creation_jobs) {
     meta->generation = ++m_next_object_generation;
     const auto generation = meta->generation;
     const auto observed_identity = meta->identity;
 
-    // No published membership until every name/class/identity read has completed.
-    // Roll back container insertions too if allocation fails part way through.
     try {
         for (size_t i = 0; i < meta->super_classes.size(); ++i) {
             const auto super = meta->super_classes[i];
@@ -1807,23 +2001,240 @@ bool UObjectHook::add_new_object(sdk::UObjectBase* object, bool run_creation_job
     m_most_recent_objects.push_front({static_cast<sdk::UObject*>(object), m_meta_objects.at(object)->full_name,
         observed_identity.index, observed_identity.serial, true, generation});
     if (m_most_recent_objects.size() > 50) { m_most_recent_objects.pop_back(); }
+    return generation;
+}
+
+void UObjectHook::enqueue_creation_jobs(sdk::UObjectBase* object, uint64_t generation,
+    const sdk::object_liveness::Identity& identity, CreationJobs&& jobs) {
+    GameThreadWorker::get().enqueue([this, object, generation, observed_identity = identity, jobs = std::move(jobs)] {
+        for (const auto& job : jobs) {
+            {
+                std::shared_lock lock{m_mutex};
+                const auto it = m_meta_objects.find(object);
+                if (it == m_meta_objects.end() || it->second->generation != generation) { return; }
+            }
+            const auto current = sdk::observe_uobject(object);
+            if (!current || !sdk::object_liveness::same_registration(observed_identity, current->identity) ||
+                sdk::object_liveness::rejected(sdk::object_liveness::current_policy(), current->flags)) { return; }
+            job(static_cast<sdk::UObject*>(object));
+        }
+    });
+}
+
+bool UObjectHook::adopt_created_object(sdk::UObjectBase* object, bool blocking) try {
+    const auto address = reinterpret_cast<uintptr_t>(object);
+    const auto array = sdk::FUObjectArray::get();
+    const auto header = sdk::UObjectBase::published_header_layout();
+
+    if (address < 0x10000 || (address & 7) != 0 || array == nullptr || header == nullptr || !header->valid()) {
+        return true;
+    }
+
+    // The object came from the engine's own allocator, so its FUObjectArray slot is the whole check:
+    // an object freed before we got to it (or anything that isn't one) no longer holds its slot.
+    const auto observed = sdk::object_liveness::observe_identity(g_seh_memory, reinterpret_cast<uintptr_t>(array),
+        sdk::FUObjectArray::get_layout(), address, header->index, header->packed_index, header);
+    uintptr_t klass{};
+    uint32_t flags{};
+
+    if (!observed || !seh_read(address + header->uclass, &klass, sizeof(klass)) || klass == 0 ||
+        !seh_read(address + header->flags, &flags, sizeof(flags))) {
+        return true;
+    }
+
+    static thread_local std::vector<sdk::UClass*> chain{};
+    chain.clear();
+
+    for (auto super = reinterpret_cast<sdk::UStruct*>(klass); super != nullptr; super = super->get_super_struct()) {
+        if (chain.size() == 128 || std::find(chain.begin(), chain.end(), super) != chain.end()) {
+            return true;
+        }
+
+        chain.push_back(static_cast<sdk::UClass*>(super));
+    }
+
+    std::shared_ptr<MotionControllerState> retired_state{};
+    CreationJobs creation_jobs{};
+    std::unique_lock lock{m_mutex, std::defer_lock};
+
+    // Creation callbacks run on whichever thread creates the object, sometimes while that thread
+    // already holds the lock further up its stack, so they never wait for it.
+    if (blocking) {
+        lock.lock();
+    } else if (!lock.try_lock()) {
+        return false;
+    }
+
+    if (exists_unsafe(object)) {
+        const auto it = m_meta_objects.find(object);
+
+        if (it != m_meta_objects.end() && it->second && it->second->uclass == reinterpret_cast<sdk::UClass*>(klass) &&
+            sdk::object_liveness::same_registration(it->second->identity, observed->identity)) {
+            return true;
+        }
+
+        // The address was reused before the old object was untracked (Avowed's destructor hook
+        // misses most objects): drop the old entry and its class chain.
+        remove_tracked_object_locked(object, nullptr, retired_state);
+    }
+
+    auto meta = std::unique_ptr<MetaObject>{};
+
+    if (!m_reusable_meta_objects.empty()) {
+        meta = std::move(m_reusable_meta_objects.back());
+        m_reusable_meta_objects.pop_back();
+    } else {
+        meta = std::make_unique<MetaObject>();
+    }
+
+    meta->uclass = reinterpret_cast<sdk::UClass*>(klass);
+    meta->super_classes.assign(chain.begin(), chain.end());
+    meta->identity = observed->identity;
+    meta->full_name.clear();
+    meta->name_pending = true;
+    meta->class_identity = true;
+    meta->is_default = (flags & 0x10u) != 0;
+
+    const auto identity = meta->identity;
+    const auto generation = publish_object_locked(object, std::move(meta), true, creation_jobs);
     lock.unlock();
 
+    ++(blocking ? m_debug.created_from_queue : m_debug.created_at_creation);
+
     if (!creation_jobs.empty()) {
-        GameThreadWorker::get().enqueue([this, object, generation, observed_identity, jobs = std::move(creation_jobs)] {
-            for (const auto& job : jobs) {
-                {
-                    std::shared_lock lock{m_mutex};
-                    const auto it = m_meta_objects.find(object);
-                    if (it == m_meta_objects.end() || it->second->generation != generation) { return; }
-                }
-                const auto current = sdk::observe_uobject(object);
-                if (!current || !sdk::object_liveness::same_registration(observed_identity, current->identity) ||
-                    sdk::object_liveness::rejected(sdk::object_liveness::current_policy(), current->flags)) { return; }
-                job(static_cast<sdk::UObject*>(object));
-            }
-        });
+        enqueue_creation_jobs(object, generation, identity, std::move(creation_jobs));
     }
+
+    return true;
+} catch (...) {
+    SPDLOG_WARN_ONCE("[UObjectHook] Refused a created object after an exception");
+    return true;
+}
+
+const std::wstring& UObjectHook::meta_name_unsafe(sdk::UObjectBase* object, const MetaObject& meta) const {
+    static const std::wstring expired{L"<expired>"};
+
+    if (!meta.name_pending) {
+        return meta.full_name;
+    }
+
+    // Only read the name while the object still holds the slot it was registered with.
+    const auto current = sdk::observe_uobject(object);
+
+    if (!current || !sdk::object_liveness::same_registration(meta.identity, current->identity)) {
+        return expired;
+    }
+
+    try {
+        meta.full_name = object->get_full_name();
+    } catch (...) {
+        return expired;
+    }
+
+    meta.name_pending = false;
+    return meta.full_name;
+}
+
+template <size_t I>
+void* UObjectHook::creation_detour(void* rcx, void* rdx, void* r8, void* r9, void* stack1, void* stack2, void* stack3, void* stack4) {
+    const auto& hook = UObjectHook::get();
+    const auto result = hook->m_creation_hooks[I].unsafe_call<void*>(rcx, rdx, r8, r9, stack1, stack2, stack3, stack4);
+
+    // AllocateUObjectIndex takes the object in rdx and returns nothing; StaticAllocateObject returns it.
+    const bool allocate_index = reinterpret_cast<uintptr_t>(rcx) == g_creation_object_array.load(std::memory_order_relaxed);
+    notify_object_created(static_cast<sdk::UObjectBase*>(allocate_index ? rdx : result));
+    return result;
+}
+
+// OW2 (UE 5.4.4): AddObject is inlined into StaticAllocateObject, so the AddObject resolver lands on an
+// unrelated hash-map helper and new objects were only found by scanning FUObjectArray. Every slot
+// assignment carries the engine's "...exists at that index!" check, both in the standalone
+// FUObjectArray::AllocateUObjectIndex and in the copy inlined into StaticAllocateObject, so hook every
+// function that contains it. Ported from satyaloka93/UEVR-AFW-Compat c3ea5c2.
+bool UObjectHook::hook_outerworlds2_creation_functions() {
+    const auto module = utility::get_executable();
+    const auto module_size = module != nullptr ? utility::get_module_size(module).value_or(0) : 0;
+    const auto object_array = reinterpret_cast<uintptr_t>(sdk::FUObjectArray::get());
+
+    if (module == nullptr || module_size == 0 || object_array == 0) {
+        return false;
+    }
+
+    const auto module_begin = reinterpret_cast<uintptr_t>(module);
+    const auto module_end = module_begin + module_size;
+    const auto needle = utility::scan_string(module, std::wstring{L"exists at that index!"});
+
+    if (!needle) {
+        SPDLOG_WARN("[OW2][UObjectHook] Object slot check string not found; using FUObjectArray scanning");
+        return false;
+    }
+
+    // Back up to the start of "Attempting to add %s at index %d but another object (...) exists at that index!".
+    auto str = *needle;
+    for (size_t i = 0; i < 512 && str > module_begin + sizeof(wchar_t) && *(wchar_t*)(str - sizeof(wchar_t)) != 0; ++i) {
+        str -= sizeof(wchar_t);
+    }
+
+    // Referenced directly (lea), or through a static UE_LOG record that holds the string's address.
+    auto refs = utility::scan_displacement_references(module, str);
+
+    for (auto record = utility::scan_ptr(module, str); record.has_value();) {
+        const auto record_refs = utility::scan_displacement_references(module, *record);
+        refs.insert(refs.end(), record_refs.begin(), record_refs.end());
+
+        const auto next = *record + sizeof(void*);
+        record = next < module_end ? utility::scan_ptr(next, module_end - next, str) : std::nullopt;
+    }
+
+    // The references sit in outlined cold blocks; the unwind chain leads back to each function's entry.
+    std::vector<uintptr_t> roots{};
+
+    for (const auto ref : refs) {
+        if (const auto root = utility::find_function_start_unwind(ref); root && std::find(roots.begin(), roots.end(), *root) == roots.end()) {
+            roots.push_back(*root);
+        }
+    }
+
+    if (roots.empty() || roots.size() > MAX_CREATION_HOOKS) {
+        SPDLOG_WARN("[OW2][UObjectHook] Unexpected object creation function count {} (references {}); using FUObjectArray scanning",
+            roots.size(), refs.size());
+        return false;
+    }
+
+    using Detour = void* (*)(void*, void*, void*, void*, void*, void*, void*, void*);
+    static constexpr std::array<Detour, MAX_CREATION_HOOKS> detours{
+        &creation_detour<0>, &creation_detour<1>, &creation_detour<2>, &creation_detour<3>
+    };
+
+    g_creation_object_array.store(object_array, std::memory_order_relaxed);
+
+    // Publish every trampoline before any detour can run, and only track creation if all of them
+    // are live: a missing function would leave its objects to a scan that is no longer running.
+    for (size_t i = 0; i < roots.size(); ++i) {
+        m_creation_hooks[i] = safetyhook::create_inline((void*)roots[i], (void*)detours[i], safetyhook::InlineHook::StartDisabled);
+
+        if (!m_creation_hooks[i]) {
+            SPDLOG_ERROR("[OW2][UObjectHook] Failed to hook object creation function at RVA {:x}; using FUObjectArray scanning",
+                roots[i] - module_begin);
+            for (auto& hook : m_creation_hooks) { hook.reset(); }
+            return false;
+        }
+    }
+
+    for (size_t i = 0; i < roots.size(); ++i) {
+        if (!m_creation_hooks[i].enable()) {
+            // Hooks already enabled may be running on other threads; leave them in place (they only
+            // register objects) and keep the scan for whatever the missing one would have seen.
+            SPDLOG_ERROR("[OW2][UObjectHook] Failed to enable object creation hook at RVA {:x}; using FUObjectArray scanning",
+                roots[i] - module_begin);
+            m_creation_hook_count = i;
+            return false;
+        }
+
+        SPDLOG_INFO("[OW2][UObjectHook] Hooked object creation function at RVA {:x}", roots[i] - module_begin);
+    }
+
+    m_creation_hook_count = roots.size();
     return true;
 }
 
@@ -2018,13 +2429,19 @@ bool UObjectHook::exists_or_track_plugin_object(sdk::UObjectBase* object) {
         return true;
     }
 
-    if (!is_stalker2_uobjecthook_guard_enabled() || !m_fully_hooked) {
+    if (is_outerworlds2_uobjecthook()) {
+        // A fresh object a script validates (uevrUtils.getValid) must not wait for tracking to catch up.
+        return m_fully_hooked && try_track_outerworlds2_object(object, false);
+    }
+
+    if ((!is_stalker2_uobjecthook_guard_enabled() && !is_avowed_uobjecthook_guard_enabled()) || !m_fully_hooked) {
         return false;
     }
 
     // The Stalker 2 profile validates dynamically-created actors before it
     // reuses them. Lazy mode deliberately skips AddObject, so safely adopt a
     // valid FUObjectArray member here instead of making the profile respawn it.
+    // Avowed has no usable AddObject hook at all, so the same applies there.
     return try_track_object(object, "plugin exists()", true, false);
 }
 
@@ -2044,11 +2461,12 @@ void UObjectHook::track_plugin_created_component(sdk::UActorComponent* component
         return;
     }
 
-    if (!is_stalker2_uobjecthook_guard_enabled() || component == nullptr || !m_fully_hooked) {
+    if ((!is_stalker2_uobjecthook_guard_enabled() && !is_avowed_uobjecthook_guard_enabled()) ||
+        component == nullptr || !m_fully_hooked) {
         return;
     }
 
-    // Stalker 2 skips the global AddObject path in lazy mode. Components
+    // Stalker 2 skips the global AddObject path in lazy mode (Avowed has none). Components
     // returned directly to plugins must still be adopted so controller and
     // attachment code can validate and update them normally.
     if (try_track_object(component, "plugin API component", true, false)) {
@@ -2070,8 +2488,8 @@ std::shared_ptr<UObjectHook::MotionControllerState> UObjectHook::get_or_add_moti
     }
 
 
-    if (stalker2_guard) {
-        // Stalker2 lazy mode skips the global AddObject hot path. Adopt objects
+    if (stalker2_guard || is_avowed_uobjecthook_guard_enabled()) {
+        // Stalker2 lazy mode skips the global AddObject hot path (Avowed has none). Adopt objects
         // explicitly handed to the plugin API so profiles can rediscover their
         // dynamically-created controller components without a full array scan.
         if (try_track_object(component, "motion-controller API component", true, false)) {
@@ -2646,6 +3064,12 @@ void UObjectHook::on_pre_engine_tick(sdk::UGameEngine* engine, float delta) {
     
     if (m_fully_hooked) {
         {
+            // Objects whose creation callback found the lock busy (returns at once when there are none).
+            UEVR_PERF_SCOPE("UObjectHook.created_queue");
+            drain_created_objects();
+        }
+
+        {
             std::shared_lock _{m_mutex};
             const auto ui_active = g_framework->is_drawing_ui();
 
@@ -2657,8 +3081,11 @@ void UObjectHook::on_pre_engine_tick(sdk::UGameEngine* engine, float delta) {
         }
 
         if (const auto scan_budget = get_uobject_array_scan_budget(engine); scan_budget > 0) {
+            UEVR_PERF_SCOPE("UObjectHook.array_scan");
             refresh_new_objects_from_uobject_array(scan_budget);
         }
+
+        UEVR_PERF_SCOPE("UObjectHook.persistent_states");
         update_persistent_states();
     }
 }
@@ -4467,6 +4894,10 @@ void UObjectHook::draw_config() {
     if (ImGui::IsItemHovered()) {
         ImGui::SetTooltip("Flushes log.txt after every message once UObjectHook activates.\nUse when the game dies with a truncated log. Takes effect on next activation.");
     }
+    m_creation_tracking->draw("Track Objects At Creation (Avowed/OW2)");
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("Registers objects as the game creates them instead of scanning the object array.\nTurn off to go back to scanning. Takes effect the next time the game starts.");
+    }
 
     ImGui::SetNextItemOpen(true, ImGuiCond_::ImGuiCond_Once);
     if (ImGui::TreeNode("UObjectHook Keybinds")) {
@@ -4486,6 +4917,10 @@ void UObjectHook::draw_developer() {
         // uint64_t
         ImGui::Text("Constructor calls: %llu", m_debug.constructor_calls.load());
         ImGui::Text("Destructor calls: %llu", m_debug.destructor_calls.load());
+        ImGui::Text("Creation tracking: %s (%llu creation hooks)", m_creation_tracking_active.load() ? "active" : "off",
+            (unsigned long long)m_creation_hook_count);
+        ImGui::Text("Registered at creation / later (backfill or queue): %llu / %llu",
+            m_debug.created_at_creation.load(), m_debug.created_from_queue.load());
 
         ImGui::TreePop();
     }
@@ -4682,7 +5117,7 @@ std::optional<UObjectHook::BrowserRow> UObjectHook::cached_browser_row(sdk::UObj
     const auto it = m_meta_objects.find(object);
     if (it == m_meta_objects.end() || !it->second) { return std::nullopt; }
     const auto& meta = *it->second;
-    return BrowserRow{object, meta.full_name, {}, meta.identity, meta.generation, meta.is_default, meta.uclass};
+    return BrowserRow{object, meta_name_unsafe(object, meta), {}, meta.identity, meta.generation, meta.is_default, meta.uclass};
 }
 
 bool UObjectHook::is_current_browser_row(const BrowserRow& row) const {
@@ -4995,7 +5430,8 @@ void UObjectHook::draw_main() {
                 continue;
             }
 
-            const auto label = utility::narrow(recent.full_name);
+            // Objects registered at creation are added without a name; the row has it resolved.
+            const auto label = utility::narrow(recent.full_name.empty() ? row->name : recent.full_name);
             ImGui::PushID(recent.object);
 
             if (ImGui::TreeNode(label.c_str())) {
@@ -5148,11 +5584,11 @@ void UObjectHook::draw_main() {
                         const auto it = m_meta_objects.find(klass);
                         if (objects.empty() || it == m_meta_objects.end() || !it->second) { continue; }
                         const auto& meta = *it->second;
-                        BrowserRow row{klass, meta.full_name, {}, meta.identity, meta.generation, meta.is_default, meta.uclass};
+                        BrowserRow row{klass, meta_name_unsafe(klass, meta), {}, meta.identity, meta.generation, meta.is_default, meta.uclass};
                         if (const auto hierarchy = m_class_hierarchy.find(klass); hierarchy != m_class_hierarchy.end()) {
                             for (const auto super : hierarchy->second) {
                                 const auto found = m_meta_objects.find(super);
-                                if (found != m_meta_objects.end() && found->second) { row.class_names.push_back(found->second->full_name); }
+                                if (found != m_meta_objects.end() && found->second) { row.class_names.push_back(meta_name_unsafe(super, *found->second)); }
                             }
                         }
                         pending.rows.push_back(std::move(row));
@@ -5232,7 +5668,7 @@ void UObjectHook::draw_main() {
                             const auto it = m_meta_objects.find(object);
                             if (it == m_meta_objects.end() || !it->second) { continue; }
                             const auto& meta = *it->second;
-                            next.rows.push_back({object, meta.full_name, {}, meta.identity, meta.generation, meta.is_default, meta.uclass});
+                            next.rows.push_back({object, meta_name_unsafe(object, meta), {}, meta.identity, meta.generation, meta.is_default, meta.uclass});
                         }
                         lock.unlock();
                         std::sort(next.rows.begin(), next.rows.end(), [](const auto& a, const auto& b) {
@@ -6899,9 +7335,77 @@ bool UObjectHook::is_tracked_identity_current_unsafe(sdk::UObjectBase* object) c
         return false;
     }
 
+    const auto& meta = *it->second;
+
+    if (meta.class_identity) {
+        // Registered during construction, when the vtable was still a base class's: compare the
+        // slot registration, then the class (only read once the slot shows the object is live).
+        const auto current = sdk::observe_uobject(object);
+        const auto header = sdk::UObjectBase::published_header_layout();
+        uintptr_t klass{};
+        return current && header != nullptr && sdk::object_liveness::same_registration(meta.identity, current->identity) &&
+            seh_read(reinterpret_cast<uintptr_t>(object) + header->uclass, &klass, sizeof(klass)) &&
+            klass == reinterpret_cast<uintptr_t>(meta.uclass);
+    }
+
     // Only the slot and the safely-read header are compared; the object's own memory may
     // already be freed or reused. No flag policy: a pending-kill object still exists().
-    return sdk::is_current_object(it->second->identity, false);
+    return sdk::is_current_object(meta.identity, false);
+}
+
+namespace {
+std::mutex g_created_objects_mutex;
+std::vector<sdk::UObjectBase*> g_created_objects;
+}
+
+void UObjectHook::notify_object_created(sdk::UObjectBase* object) {
+    // Registered on the creating thread, so a level load's objects are tracked while it loads instead
+    // of on the game thread afterwards. The object is still being constructed (its identity uses the
+    // class, not the vtable). Only when the lock is busy is it queued for the next pre-engine tick.
+    if (object == nullptr) {
+        return;
+    }
+
+    if (const auto& hook = UObjectHook::get(); hook != nullptr && hook->adopt_created_object(object, false)) {
+        return;
+    }
+
+    std::scoped_lock _{g_created_objects_mutex};
+    g_created_objects.push_back(object);
+}
+
+void UObjectHook::drain_created_objects() {
+    std::vector<sdk::UObjectBase*> created;
+
+    {
+        std::scoped_lock _{g_created_objects_mutex};
+
+        if (g_created_objects.empty()) {
+            return;
+        }
+
+        created.swap(g_created_objects);
+    }
+
+    // Newest first: an address freed and reused within the batch belongs to the later object, and
+    // objects a script just created are registered before older ones. Whatever is left after the
+    // budget goes back to the front of the queue for the next tick.
+    constexpr auto budget = std::chrono::milliseconds(2);
+    const auto start = std::chrono::steady_clock::now();
+    auto it = created.rbegin();
+
+    for (; it != created.rend(); ++it) {
+        if (std::chrono::steady_clock::now() - start > budget) {
+            break;
+        }
+
+        adopt_created_object(*it, true);
+    }
+
+    if (it != created.rend()) {
+        std::scoped_lock _{g_created_objects_mutex};
+        g_created_objects.insert(g_created_objects.begin(), created.begin(), it.base());
+    }
 }
 
 void UObjectHook::notify_object_index_freed(sdk::UObjectBase* object) {
@@ -6910,11 +7414,16 @@ void UObjectHook::notify_object_index_freed(sdk::UObjectBase* object) {
 }
 
 void UObjectHook::remove_tracked_object(sdk::UObjectBase* object, const sdk::object_liveness::Identity* identity) {
-    auto* hook = this;
+    // Released after the lock, so the state's destructor never runs under it.
     std::shared_ptr<MotionControllerState> retired_state;
-    {
-        std::unique_lock _{hook->m_mutex};
+    std::unique_lock _{m_mutex};
+    remove_tracked_object_locked(object, identity, retired_state);
+}
 
+void UObjectHook::remove_tracked_object_locked(sdk::UObjectBase* object, const sdk::object_liveness::Identity* identity,
+    std::shared_ptr<MotionControllerState>& retired_state) {
+    auto* hook = this;
+    {
         if (auto it = hook->m_meta_objects.find(object); it != hook->m_meta_objects.end()) {
             if (identity && !sdk::object_liveness::same_registration(it->second->identity, *identity)) { return; }
             ++hook->m_debug.destructor_calls;

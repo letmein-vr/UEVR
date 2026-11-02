@@ -10,6 +10,8 @@
 #include <future>
 #include <optional>
 #include <atomic>
+#include <array>
+#include <functional>
 
 #include <nlohmann/json.hpp>
 
@@ -55,6 +57,11 @@ public:
 
     // Called from the Stalker 2 FUObjectArray free-slot hooks while the slot still holds the object.
     static void notify_object_index_freed(sdk::UObjectBase* object);
+
+    // Called from the Avowed FUObjectCreateListener and the OW2 creation hooks once the object holds its
+    // FUObjectArray slot. Registers it on the calling thread, or queues it for the next pre-engine tick
+    // (drain_created_objects) when the lock is busy.
+    static void notify_object_created(sdk::UObjectBase* object);
 
     bool is_live_tracked_object(sdk::UObjectBase* object) const;
 
@@ -219,7 +226,7 @@ private:
         return m_objects.contains(object);
     }
 
-    // The object's registered FUObjectArray identity is still current (Stalker 2 only).
+    // The object's registered FUObjectArray identity is still current (Stalker 2 and Avowed only).
     bool is_tracked_identity_current_unsafe(sdk::UObjectBase* object) const;
 
     void hook();
@@ -266,6 +273,7 @@ private:
     std::shared_ptr<PersistentCameraState> deserialize_camera_state();
     void update_persistent_states();
     void refresh_new_objects_from_uobject_array(uint32_t max_objects = 4096);
+    void drain_created_objects();
     void refresh_outerworlds2_objects(sdk::FUObjectArray* array, int32_t object_count, uint32_t max_objects);
     bool try_track_outerworlds2_object(sdk::UObjectBase* object, bool run_creation_jobs);
     uint32_t get_uobject_array_scan_budget(sdk::UGameEngine* engine);
@@ -300,6 +308,8 @@ private:
     struct DebugInfo {
         std::atomic<uint64_t> constructor_calls{0};
         std::atomic<uint64_t> destructor_calls{0};
+        std::atomic<uint64_t> created_at_creation{0};
+        std::atomic<uint64_t> created_from_queue{0};
     } m_debug{};
 
     glm::vec3 m_last_left_grip_location{};
@@ -310,12 +320,18 @@ private:
     mutable std::shared_mutex m_mutex{};
 
     struct MetaObject {
-        std::wstring full_name{};
+        // Objects registered at creation skip the name read (it cost more than the rest of the
+        // registration); the UI resolves it on first display. Only the UI thread fills it afterwards.
+        mutable std::wstring full_name{};
+        mutable bool name_pending{};
         sdk::UClass* uclass{nullptr};
         std::vector<sdk::UClass*> super_classes{};
         sdk::object_liveness::Identity identity{};
         uint64_t generation{};
         bool is_default{};
+        // Registered while the object was being constructed, so the recorded vtable is a base
+        // class's: identity checks compare the FUObjectArray registration and the class instead.
+        bool class_identity{};
     };
 
     std::unordered_set<sdk::UObjectBase*> m_objects{};
@@ -323,6 +339,28 @@ private:
     std::unordered_map<sdk::UClass*, std::unordered_set<sdk::UObjectBase*>> m_objects_by_class{};
 
     std::deque<std::unique_ptr<MetaObject>> m_reusable_meta_objects{};
+
+    using CreationJobs = std::vector<std::function<void(sdk::UObject*)>>;
+    uint64_t publish_object_locked(sdk::UObjectBase* object, std::unique_ptr<MetaObject> meta, bool run_creation_jobs,
+        CreationJobs& creation_jobs);
+    void enqueue_creation_jobs(sdk::UObjectBase* object, uint64_t generation,
+        const sdk::object_liveness::Identity& identity, CreationJobs&& jobs);
+    void remove_tracked_object_locked(sdk::UObjectBase* object, const sdk::object_liveness::Identity* identity,
+        std::shared_ptr<MotionControllerState>& retired_state);
+    const std::wstring& meta_name_unsafe(sdk::UObjectBase* object, const MetaObject& meta) const;
+
+    // Avowed (GUObjectArray create listener) and OW2 (creation function hooks): registers an object
+    // the engine is creating, without the validation scans or the name read. Returns false only when
+    // it would have to wait for the lock and blocking is false; the caller then queues the object.
+    bool adopt_created_object(sdk::UObjectBase* object, bool blocking);
+    bool hook_outerworlds2_creation_functions();
+    template <size_t I>
+    static void* creation_detour(void* rcx, void* rdx, void* r8, void* r9, void* stack1, void* stack2, void* stack3, void* stack4);
+
+    static constexpr size_t MAX_CREATION_HOOKS = 4;
+    std::array<SafetyHookInline, MAX_CREATION_HOOKS> m_creation_hooks{};
+    size_t m_creation_hook_count{};
+    std::atomic_bool m_creation_tracking_active{false};
 
     SafetyHookInline m_add_object_hook{};
     SafetyHookInline m_destructor_hook{};
@@ -647,6 +685,9 @@ private:
     // Diagnostics: once UObjectHook activates, flush log.txt after every line so the tail is
     // trustworthy if the process dies. Off by default; a flush per line can hitch on titles that log heavily.
     ModToggle::Ptr m_log_flush_all{ModToggle::create(generate_name("LogFlushAll"), false)};
+    // Avowed/OW2: register objects as the engine creates them instead of scanning FUObjectArray.
+    // Read once when UObjectHook activates; off restores the array scan.
+    ModToggle::Ptr m_creation_tracking{ModToggle::create(generate_name("CreationTracking"), true)};
 
     ModKey::Ptr m_keybind_toggle_uobject_hook{ModKey::create(generate_name("ToggleUObjectHookKey"))};
     bool m_uobject_hook_disabled{false};
@@ -689,6 +730,7 @@ public:
             *m_attach_lerp_enabled,
             *m_attach_lerp_speed,
             *m_log_flush_all,
+            *m_creation_tracking,
             *m_keybind_toggle_uobject_hook
         };
     }

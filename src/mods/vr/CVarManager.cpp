@@ -24,6 +24,7 @@
 #include "CVarManager.hpp"
 #include "FrameProfiler.hpp"
 #include "SatisfactoryRuntime.hpp"
+#include "mods/GameSpecific.hpp"
 #include "mods/VR.hpp"
 #include "utility/ImGui.hpp"
 #include "utility/Logging.hpp"
@@ -183,6 +184,10 @@ bool is_windrose_ue56_dx12_current_game_for_cvars() {
 // SetByConsole (0x0E000000) is what the in-game console uses and outranks everything.
 constexpr uint32_t SET_BY_DEFAULT = 0x08000000;
 constexpr uint32_t SET_BY_CONSOLE_UE55 = 0x0E000000;
+// Avowed (UE 5.3, the enum without the 5.4+ entries): 0x08000000 is SetByCommandline and
+// SetByConsole is 0x0A000000. The game applies r.ScreenPercentage at Console priority, so the
+// cvar's Set (vtable 16) rejects every lower-priority write and the value stays frozen.
+constexpr uint32_t SET_BY_CONSOLE_UE53 = 0x0A000000;
 
 bool supports_ue55_console_set_by() {
     static const bool result = []() {
@@ -195,6 +200,28 @@ bool supports_ue55_console_set_by() {
     }();
 
     return result;
+}
+
+bool is_avowed_cvar_target() {
+    static const bool result = []() {
+        const auto exe_path = utility::get_module_pathw(utility::get_executable());
+        return exe_path && uevr::games::is_avowed_executable_path(*exe_path);
+    }();
+
+    return result;
+}
+
+// The SetBy value that outranks the game's own writes, where the enum layout is verified.
+std::optional<uint32_t> console_set_by_flags() {
+    if (supports_ue55_console_set_by()) {
+        return SET_BY_CONSOLE_UE55;
+    }
+
+    if (is_avowed_cvar_target()) {
+        return SET_BY_CONSOLE_UE53;
+    }
+
+    return std::nullopt;
 }
 
 bool propagate_alpha_allows_tonemapper_value() {
@@ -633,7 +660,14 @@ void CVarManager::CVar::finish_ui_write(uint64_t request_id, bool callable) {
 }
 
 uint32_t CVarManager::CVar::get_set_by_flags() const {
-    return m_set_by_escalated ? SET_BY_CONSOLE_UE55 : SET_BY_DEFAULT;
+    // Avowed applies its graphics cvars at Console priority, so every lower-priority write is rejected
+    // up front. Escalating only after unheld freeze writes never reached UI writes, and the unheld check
+    // relies on a readback that does not work on this build.
+    if (is_avowed_cvar_target()) {
+        return SET_BY_CONSOLE_UE53;
+    }
+
+    return m_set_by_escalated ? console_set_by_flags().value_or(SET_BY_DEFAULT) : SET_BY_DEFAULT;
 }
 
 void CVarManager::CVar::note_freeze_enforce(bool needed_set) {
@@ -647,7 +681,7 @@ void CVarManager::CVar::note_freeze_enforce(bool needed_set) {
         return;
     }
 
-    if (m_set_by_escalated || ++m_unheld_freeze_sets < ESCALATE_AFTER_UNHELD_SETS || !supports_ue55_console_set_by()) {
+    if (m_set_by_escalated || ++m_unheld_freeze_sets < ESCALATE_AFTER_UNHELD_SETS || !console_set_by_flags()) {
         return;
     }
 

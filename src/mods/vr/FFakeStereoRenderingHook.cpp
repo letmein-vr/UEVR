@@ -1527,11 +1527,14 @@ void dune_record_final_view_observation(const DuneFinalViewObservation& observat
     }
 }
 
-constexpr uint32_t AVOWED_NATIVE_FIX_STABLE_FRAMES = 180;
-constexpr uint32_t AVOWED_NATIVE_FIX_FAST_REACQUIRE_STABLE_FRAMES = 45;
+// The long hold (10 s + 180 frames) predates the FScene frame-count fix: decrement_frame_count was
+// hitting a uniform-buffer pointer at +0x34, and the old world's FScene crashed at teardown. With the
+// real SceneFrameNumber (+0x4718) the gate only needs the targets to stay unchanged for a few frames.
+constexpr uint32_t AVOWED_NATIVE_FIX_STABLE_FRAMES = 10;
+constexpr uint32_t AVOWED_NATIVE_FIX_FAST_REACQUIRE_STABLE_FRAMES = 5;
 constexpr auto AVOWED_NATIVE_FIX_RENDER_GAP = std::chrono::milliseconds(250);
-constexpr auto AVOWED_NATIVE_FIX_TRANSITION_HOLD = std::chrono::seconds(10);
-constexpr auto AVOWED_NATIVE_FIX_FAST_REACQUIRE_HOLD = std::chrono::milliseconds(1500);
+constexpr auto AVOWED_NATIVE_FIX_TRANSITION_HOLD = std::chrono::milliseconds(0);
+constexpr auto AVOWED_NATIVE_FIX_FAST_REACQUIRE_HOLD = std::chrono::milliseconds(0);
 constexpr auto AVOWED_NATIVE_FIX_FAST_REACQUIRE_MAX_MISSING = std::chrono::seconds(60);
 
 bool is_deadzone_ue56_executable() {
@@ -1799,6 +1802,102 @@ bool avowed_is_current_game() {
 
     return result;
 }
+
+bool borderlands4_is_current_game() {
+    static const bool result = []() {
+        const auto exe_path = utility::get_module_pathw(utility::get_executable());
+        return exe_path && uevr::games::is_borderlands4_executable_path(*exe_path);
+    }();
+
+    return result;
+}
+
+// Borderlands 4 adds a foreground projection matrix (used by bGbxForeground
+// primitives: first-person arms and weapon) to FSceneViewInitOptions right
+// after the stock projection data. The game fills it in its mono projection
+// path; when a stereo device supplies the projection that path is skipped and
+// the matrix stays identity, which throws every foreground vertex out of clip
+// space. Measured on the 5.5.4 build: projection at +0xA0, foreground
+// projection at +0x1E0, both FMatrix (double).
+namespace borderlands4_foreground_projection {
+constexpr uintptr_t PROJECTION_OFFSET = 0xA0;
+constexpr uintptr_t FOREGROUND_PROJECTION_OFFSET = 0x1E0;
+constexpr size_t MATRIX_SIZE = sizeof(double) * 16;
+
+bool is_identity(const double* m) {
+    for (size_t i = 0; i < 16; ++i) {
+        if (m[i] != ((i % 5) == 0 ? 1.0 : 0.0)) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+bool is_perspective(const double* m) {
+    for (size_t i = 0; i < 16; ++i) {
+        if (!std::isfinite(m[i])) {
+            return false;
+        }
+    }
+
+    return m[11] == 1.0 && m[15] == 0.0 && m[0] > 0.0 && m[5] > 0.0;
+}
+
+void apply(sdk::FSceneViewInitOptions* init_options) {
+    if (init_options == nullptr ||
+        !is_readable_process_range(reinterpret_cast<uintptr_t>(init_options), FOREGROUND_PROJECTION_OFFSET + MATRIX_SIZE))
+    {
+        return;
+    }
+
+    auto* const bytes = reinterpret_cast<uint8_t*>(init_options);
+    double projection[16]{};
+    double foreground[16]{};
+    std::memcpy(projection, bytes + PROJECTION_OFFSET, MATRIX_SIZE);
+    std::memcpy(foreground, bytes + FOREGROUND_PROJECTION_OFFSET, MATRIX_SIZE);
+
+    if (!is_identity(foreground) || !is_perspective(projection)) {
+        return;
+    }
+
+    std::memcpy(bytes + FOREGROUND_PROJECTION_OFFSET, projection, MATRIX_SIZE);
+    SPDLOG_INFO_ONCE("[Borderlands4][ForegroundProjection] Filled identity foreground projection from the stereo "
+        "projection (m00={:.6f} m11={:.6f} m20={:.6f} m21={:.6f})",
+        projection[0], projection[5], projection[8], projection[9]);
+}
+} // namespace borderlands4_foreground_projection
+
+// Borderlands 4 builds scene views (inventory 3D item preview and others) whose init options do not hold a view
+// family where the resolved layout expects one: crash dumps 2026-10-30 showed 0x20, 0x1 and a heap address 0x40
+// bytes before an unmapped page. sceneview_constructor_impl dereferences it; such views must reach the game's
+// constructor untouched.
+namespace borderlands4_view_family {
+bool is_readable(uintptr_t address, size_t size) {
+    for (auto cursor = address; cursor < address + size;) {
+        MEMORY_BASIC_INFORMATION mbi{};
+        if (VirtualQuery(reinterpret_cast<const void*>(cursor), &mbi, sizeof(mbi)) == 0 || mbi.State != MEM_COMMIT ||
+            (mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS)) != 0) {
+            return false;
+        }
+
+        cursor = reinterpret_cast<uintptr_t>(mbi.BaseAddress) + mbi.RegionSize;
+    }
+
+    return true;
+}
+
+// Address range + readable memory only. A Views TArray sanity test (num 0..16 <= max) was tried too (43a9f943) and
+// rejected the REAL view families on BL4 (the layout's views offset does not hold the array there): those views then
+// skipped UEVR's processing and the foreground fix, so the VR hands / gun (foreground layer) vanished (2026-10-30).
+// Both crash cases are covered without it: 0x20 / 0x1 by the range, the heap pointer by the readable check.
+bool is_plausible(const sdk::FSceneViewFamily* family) {
+    constexpr size_t MIN_READABLE = 0x100; // covers the views / render target / scene offsets the layout accepts
+
+    const auto address = reinterpret_cast<uintptr_t>(family);
+    return address >= 0x10000 && address < 0x800000000000ull && (address & 7) == 0 && is_readable(address, MIN_READABLE);
+}
+} // namespace borderlands4_view_family
 
 bool dune_awakening_is_current_game() {
     static const bool result = []() {
@@ -2377,6 +2476,38 @@ bool dune_is_auxiliary_view_family(sdk::FSceneViewFamily* view_family, const cha
             source != nullptr ? source : "<unknown>");
         return false;
     }
+}
+
+// Borderlands 4 draws the map (OakMapViewer) and the inventory/character previews (GbxStandInViewer) through
+// GbxSceneViewerSceneCaptureComponent families in their own transient worlds, rendered during
+// UGameViewportClient::Draw. Treated as the main viewport they re-run UEVR's per-frame pose/frame bookkeeping and
+// stereo view processing several times a frame ("vtable is already hooked" spam), which flickers the VR view
+// behind menus and breaks the map capture. Their render target is never the main viewport (the family layout's
+// render target offset is resolved by matching that pointer), so the target identifies them.
+bool borderlands4_is_auxiliary_view_family(sdk::FSceneViewFamily* view_family, const char* source) {
+    if (!borderlands4_is_current_game() || view_family == nullptr || g_hook == nullptr ||
+        !sdk::FSceneViewFamily::has_offsets())
+    {
+        return false;
+    }
+
+    auto* rtm = g_hook->get_render_target_manager();
+    auto* main_viewport = rtm != nullptr ? rtm->get_viewport() : nullptr;
+    auto* family_target = view_family->get_render_target();
+
+    if (main_viewport == nullptr || family_target == nullptr ||
+        reinterpret_cast<void*>(family_target) == reinterpret_cast<void*>(main_viewport))
+    {
+        return false;
+    }
+
+    SPDLOG_INFO_EVERY_N_SEC(
+        2,
+        "[Borderlands4] Isolating auxiliary SceneCapture view family at {} target={:x} main_viewport={:x}",
+        source != nullptr ? source : "<unknown>",
+        reinterpret_cast<uintptr_t>(family_target),
+        reinterpret_cast<uintptr_t>(main_viewport));
+    return true;
 }
 
 bool subnautica2_is_current_game() {
@@ -13371,6 +13502,170 @@ std::optional<FakeStereoConstructorLayout> locate_fake_stereo_constructor_layout
 
     return std::nullopt;
 }
+
+struct InlinedFakeStereoDevice {
+    uintptr_t vtable{};
+    uintptr_t engine_offset{};
+};
+
+// Avowed (2026-10-26 build) inlines `new FFakeStereoRendering` into UEngine::InitializeHMDDevice:
+// a 0x18-byte allocation, the vtable stored 0xCC bytes in, then `mov [this+0xE80], object`.
+// The vtable is accepted only when one object is seen allocated, given it at +0 and stored
+// into the engine.
+std::optional<InlinedFakeStereoDevice> locate_inlined_fake_stereo_device(uintptr_t initialize_hmd_device) {
+    constexpr uint64_t max_allocation_size = 0x400;
+    constexpr size_t max_size_to_call_instructions = 3;
+
+    const auto function = get_runtime_function_range(initialize_hmd_device);
+    if (!function || function->begin != initialize_hmd_device) {
+        return std::nullopt;
+    }
+
+    const auto is_nonvolatile_register = [](uint32_t reg) {
+        return reg == NDR_RBX || reg == NDR_RBP || reg == NDR_RSI || reg == NDR_RDI ||
+            (reg >= NDR_R12 && reg <= NDR_R15);
+    };
+
+    std::vector<uint32_t> engine_registers{NDR_RCX};
+    const auto is_engine_register = [&](uint32_t reg) {
+        return std::find(engine_registers.begin(), engine_registers.end(), reg) != engine_registers.end();
+    };
+
+    // Allocated objects by the nonvolatile register holding them, with the vtable stored at +0 so
+    // far. The shared-pointer reference controller is allocated before the device is stored.
+    struct AllocatedObject {
+        uint32_t reg{};
+        std::optional<uintptr_t> vtable{};
+    };
+    std::vector<AllocatedObject> objects{};
+    const auto find_object = [&](uint32_t reg) -> AllocatedObject* {
+        const auto it = std::find_if(objects.begin(), objects.end(), [&](const auto& object) { return object.reg == reg; });
+        return it != objects.end() ? &*it : nullptr;
+    };
+
+    size_t instruction_index = 0;
+    std::optional<size_t> size_load_index{};
+    bool awaiting_allocation_result = false;
+    std::optional<uint32_t> loaded_vtable_register{};
+    std::optional<uintptr_t> loaded_vtable{};
+
+    for (auto ip = function->begin; ip < function->end; ++instruction_index) {
+        const auto decoded = utility::decode_one(reinterpret_cast<uint8_t*>(ip));
+        if (!decoded || decoded->Length == 0 || ip + decoded->Length > function->end) {
+            break;
+        }
+
+        const auto& ix = *decoded;
+        const bool is_call = std::string_view{ix.Mnemonic}.starts_with("CALL");
+        const bool writes_register = ix.OperandsCount >= 1 && ix.Operands[0].Type == ND_OP_REG && ix.Operands[0].Access.Write;
+        const auto written_register = writes_register ? std::optional<uint32_t>{ix.Operands[0].Info.Register.Reg} : std::nullopt;
+        const bool is_reg64_move = ix.Instruction == ND_INS_MOV && ix.OperandsCount >= 2 &&
+            ix.Operands[0].Type == ND_OP_REG && ix.Operands[0].Size == sizeof(uintptr_t) &&
+            ix.Operands[1].Type == ND_OP_REG && ix.Operands[1].Size == sizeof(uintptr_t);
+
+        // mov rObject, rax right after a sized allocation call.
+        const bool takes_allocation = awaiting_allocation_result && is_reg64_move &&
+            ix.Operands[1].Info.Register.Reg == NDR_RAX &&
+            is_nonvolatile_register(ix.Operands[0].Info.Register.Reg);
+        const bool copies_engine = is_reg64_move &&
+            is_engine_register(ix.Operands[1].Info.Register.Reg) &&
+            is_nonvolatile_register(ix.Operands[0].Info.Register.Reg);
+        awaiting_allocation_result = false;
+
+        const bool stores_register_to_memory = ix.Instruction == ND_INS_MOV && ix.OperandsCount >= 2 &&
+            ix.Operands[0].Type == ND_OP_MEM && ix.Operands[0].Size == sizeof(uintptr_t) &&
+            ix.Operands[0].Info.Memory.HasBase && !ix.Operands[0].Info.Memory.HasIndex &&
+            ix.Operands[1].Type == ND_OP_REG && ix.Operands[1].Size == sizeof(uintptr_t);
+        const auto store_displacement = stores_register_to_memory && ix.Operands[0].Info.Memory.HasDisp
+            ? ix.Operands[0].Info.Memory.Disp
+            : 0;
+
+        // mov [rObject], rVtable
+        if (stores_register_to_memory && store_displacement == 0 &&
+            loaded_vtable_register && loaded_vtable &&
+            ix.Operands[1].Info.Register.Reg == *loaded_vtable_register)
+        {
+            if (auto* const object = find_object(ix.Operands[0].Info.Memory.Base)) {
+                object->vtable = *loaded_vtable;
+            }
+        }
+
+        // mov [rEngine + offset], rObject
+        if (stores_register_to_memory && store_displacement > 0 &&
+            is_engine_register(ix.Operands[0].Info.Memory.Base))
+        {
+            const auto* const object = find_object(ix.Operands[1].Info.Register.Reg);
+
+            if (object != nullptr && object->vtable) {
+                return InlinedFakeStereoDevice{
+                    .vtable = *object->vtable,
+                    .engine_offset = static_cast<uintptr_t>(store_displacement),
+                };
+            }
+        }
+
+        if (ix.Instruction == ND_INS_LEA && ix.OperandsCount >= 2 && ix.IsRipRelative &&
+            ix.Operands[0].Type == ND_OP_REG && ix.Operands[0].Size == sizeof(uintptr_t) &&
+            ix.Operands[1].Type == ND_OP_MEM)
+        {
+            const auto candidate = utility::resolve_displacement(ip, &ix);
+            const auto candidate_module = candidate ? utility::get_module_within(*candidate) : std::nullopt;
+
+            if (candidate && candidate_module &&
+                reinterpret_cast<uintptr_t>(*candidate_module) == function->image_base &&
+                looks_like_virtual_function_table(*candidate))
+            {
+                loaded_vtable_register = static_cast<uint32_t>(ix.Operands[0].Info.Register.Reg);
+                loaded_vtable = *candidate;
+            } else {
+                loaded_vtable_register.reset();
+                loaded_vtable.reset();
+            }
+        } else if (written_register && loaded_vtable_register && *written_register == *loaded_vtable_register) {
+            loaded_vtable_register.reset();
+            loaded_vtable.reset();
+        }
+
+        // Track register clobbers after the patterns above have read this instruction.
+        if (written_register) {
+            std::erase_if(objects, [&](const auto& object) { return object.reg == *written_register; });
+
+            if (!copies_engine) {
+                std::erase(engine_registers, *written_register);
+            }
+        }
+
+        if (copies_engine && !is_engine_register(ix.Operands[0].Info.Register.Reg)) {
+            engine_registers.push_back(static_cast<uint32_t>(ix.Operands[0].Info.Register.Reg));
+        }
+
+        if (takes_allocation) {
+            objects.push_back(AllocatedObject{.reg = static_cast<uint32_t>(ix.Operands[0].Info.Register.Reg)});
+        }
+
+        // mov ecx, size (operator new's size argument), then the call within a few instructions.
+        if (ix.Instruction == ND_INS_MOV && ix.OperandsCount >= 2 &&
+            ix.Operands[0].Type == ND_OP_REG && ix.Operands[0].Info.Register.Reg == NDR_RCX &&
+            ix.Operands[1].Type == ND_OP_IMM && ix.Operands[1].Info.Immediate.Imm > 0 &&
+            ix.Operands[1].Info.Immediate.Imm <= max_allocation_size)
+        {
+            size_load_index = instruction_index;
+        }
+
+        if (is_call) {
+            awaiting_allocation_result = size_load_index &&
+                instruction_index - *size_load_index <= max_size_to_call_instructions;
+            size_load_index.reset();
+            loaded_vtable_register.reset();
+            loaded_vtable.reset();
+            std::erase_if(engine_registers, [&](uint32_t reg) { return !is_nonvolatile_register(reg); });
+        }
+
+        ip += ix.Length;
+    }
+
+    return std::nullopt;
+}
 }
 
 // Scan through function instructions to detect usage of double
@@ -16394,7 +16689,9 @@ void FFakeStereoRenderingHook::attempt_hook_fsceneview_constructor() {
 
     auto& vr = VR::get();
 
-    if (!vr->is_ghosting_fix_enabled() && !vr->is_splitscreen_compatibility_enabled() && !vr->is_sceneview_compatibility_enabled() && !vr->is_native_stereo_fix_enabled()) {
+    // Borderlands 4 always hooks the constructor for the foreground projection fix.
+    if (!borderlands4_is_current_game() &&
+        !vr->is_ghosting_fix_enabled() && !vr->is_splitscreen_compatibility_enabled() && !vr->is_sceneview_compatibility_enabled() && !vr->is_native_stereo_fix_enabled()) {
         return;
     }
 
@@ -22969,6 +23266,24 @@ bool FFakeStereoRenderingHook::refresh_ghosting_fix_owner(GhostingFixPair& pair,
 
 // FSceneView constructor hook
 sdk::FSceneView* FFakeStereoRenderingHook::sceneview_constructor(sdk::FSceneView* view, sdk::FSceneViewInitOptions* init_options, void* a3, void* a4) {
+    if (borderlands4_is_current_game()) {
+        // Views whose init options hold no real ViewFamily where the layout expects one (see
+        // borderlands4_view_family) go straight to the game's constructor, without UEVR's stereo processing or
+        // the foreground fix. A null family keeps the normal path (impl handles it).
+        const auto family_ptr = init_options != nullptr ? init_options->get_view_family() : nullptr;
+        const auto family = reinterpret_cast<uintptr_t>(family_ptr);
+        if (family != 0 && !borderlands4_view_family::is_plausible(family_ptr)) {
+            SPDLOG_INFO_ONCE("[Borderlands4] Passing a scene view with an invalid ViewFamily ({:x}) to the game constructor", family);
+            return g_hook->m_sceneview_data.constructor_hook.unsafe_call<sdk::FSceneView*>(view, init_options, a3, a4);
+        }
+
+        borderlands4_foreground_projection::apply(init_options);
+    }
+
+    return sceneview_constructor_impl(view, init_options, a3, a4);
+}
+
+sdk::FSceneView* FFakeStereoRenderingHook::sceneview_constructor_impl(sdk::FSceneView* view, sdk::FSceneViewInitOptions* init_options, void* a3, void* a4) {
     SPDLOG_INFO_ONCE("Called FSceneView constructor for the first time");
 
     auto& vr = VR::get();
@@ -23177,6 +23492,14 @@ sdk::FSceneView* FFakeStereoRenderingHook::sceneview_constructor(sdk::FSceneView
             if (dimension_shift_is_auxiliary_view_family(view_family, "FSceneView constructor")) {
                 return g_hook->m_sceneview_data.constructor_hook.unsafe_call<sdk::FSceneView*>(view, init_options, a3, a4);
             }
+        }
+    }
+
+    if (borderlands4_is_current_game()) {
+        update_init_offsets();
+
+        if (borderlands4_is_auxiliary_view_family(init_options->get_view_family(), "FSceneView constructor")) {
+            return g_hook->m_sceneview_data.constructor_hook.unsafe_call<sdk::FSceneView*>(view, init_options, a3, a4);
         }
     }
 
@@ -27119,7 +27442,8 @@ void FFakeStereoRenderingHook::begin_render_viewfamily(ISceneViewExtension* exte
     }
 
     if (dune_is_auxiliary_view_family(&view_family, "BeginRenderViewFamily") ||
-        dimension_shift_is_auxiliary_view_family(&view_family, "BeginRenderViewFamily"))
+        dimension_shift_is_auxiliary_view_family(&view_family, "BeginRenderViewFamily") ||
+        borderlands4_is_auxiliary_view_family(&view_family, "BeginRenderViewFamily"))
     {
         return;
     }
@@ -28121,7 +28445,8 @@ void FFakeStereoRenderingHook::pre_render_viewfamily_renderthread(ISceneViewExte
     }
 
     if (dune_is_auxiliary_view_family(&view_family, "PreRenderViewFamily_RenderThread") ||
-        dimension_shift_is_auxiliary_view_family(&view_family, "PreRenderViewFamily_RenderThread"))
+        dimension_shift_is_auxiliary_view_family(&view_family, "PreRenderViewFamily_RenderThread") ||
+        borderlands4_is_auxiliary_view_family(&view_family, "PreRenderViewFamily_RenderThread"))
     {
         return;
     }
@@ -28577,8 +28902,32 @@ bool FFakeStereoRenderingHook::setup_view_extensions() try {
         if (uevr::nascar::is_target()) { return EXCEPTION_CONTINUE_SEARCH; }
         static std::vector<Patch::Ptr> xrsystem_patches{};
         static std::unordered_set<uintptr_t> ignored_addresses{};
+        static std::mutex handler_mutex{};
+        thread_local bool in_handler{false};
 
         if (exception->ExceptionRecord->ExceptionCode == EXCEPTION_ACCESS_VIOLATION) {
+            // Avowed: every access violation in the process lands here, on any thread (including
+            // routine IsBadReadPtr probes on loading/render threads), and the statics above are not
+            // thread-safe. This handler also probes memory itself, so a fault raised inside it must
+            // pass through instead of re-entering. Ported from satyaloka93/UEVR-AFW-Compat.
+            const bool serialize = avowed_is_current_game();
+
+            if (serialize && in_handler) {
+                return EXCEPTION_CONTINUE_SEARCH;
+            }
+
+            struct ReentryReset {
+                bool active;
+                ~ReentryReset() { if (active) { in_handler = false; } }
+            } reentry_reset{serialize};
+
+            std::unique_lock<std::mutex> handler_lock{handler_mutex, std::defer_lock};
+
+            if (serialize) {
+                in_handler = true;
+                handler_lock.lock();
+            }
+
             const auto exception_address = exception->ContextRecord->Rip;
 
             const auto daysgone_current = daysgone_is_current_game();
@@ -29697,6 +30046,23 @@ std::optional<uintptr_t> FFakeStereoRenderingHook::locate_fake_stereo_rendering_
             legacy_candidate);
     } else {
         SPDLOG_WARN("Failed to find FFakeStereoRendering VTable Reference through legacy pattern");
+    }
+
+    if (avowed_is_current_game()) {
+        if (const auto initialize_hmd_device = sdk::UEngine::get_initialize_hmd_device_address()) {
+            if (const auto inlined = locate_inlined_fake_stereo_device(*initialize_hmd_device)) {
+                SPDLOG_INFO(
+                    "[Avowed] FFakeStereoRendering VTable: {:x} (construction inlined into InitializeHMDDevice {:x}, "
+                    "stored at engine+0x{:x})",
+                    inlined->vtable,
+                    *initialize_hmd_device,
+                    inlined->engine_offset);
+                cached_result = inlined->vtable;
+                return inlined->vtable;
+            }
+        }
+
+        SPDLOG_ERROR("[Avowed] No validated inlined FFakeStereoRendering construction in InitializeHMDDevice");
     }
 
     SPDLOG_ERROR("Failed to find a validated FFakeStereoRendering VTable");
