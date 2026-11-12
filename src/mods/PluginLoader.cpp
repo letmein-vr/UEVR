@@ -1,5 +1,7 @@
 #include <sdk/DiscoveryMemory.hpp>
 #include <cmath>
+#include <algorithm>
+#include <functional>
 #include <utility/OpaqueStateRegistry.hpp>
 #include <sdk/threading/GameThreadWorker.hpp>
 #include <filesystem>
@@ -1977,11 +1979,40 @@ void PluginLoader::attempt_unload_plugins() {
             }
         }
 
+        // Remove plugin inline hooks newest-first, and before the plugin DLLs are unloaded.
+        // Hooks stacked on one target each saved the previous hook's jump as their "original"
+        // bytes, so only LIFO teardown restores the real prologue. m_inline_hooks is unordered;
+        // clearing it directly could leave the target jumping into a freed trampoline, which the
+        // reloaded plugin then re-hooks into a jump cycle (Cronos stack overflow, 2026-11-12).
+        // Unhooking after FreeLibrary also left live hooks pointing into unmapped code.
+        {
+            std::scoped_lock _{m_mux};
+
+            std::vector<size_t> hook_ids{};
+            hook_ids.reserve(m_inline_hooks.size());
+
+            for (const auto& [id, _state] : m_inline_hooks) {
+                hook_ids.push_back(id);
+            }
+
+            std::sort(hook_ids.begin(), hook_ids.end(), std::greater<size_t>{});
+
+            for (const auto id : hook_ids) {
+                auto& state = m_inline_hooks[id];
+
+                if (state != nullptr) {
+                    std::scoped_lock __{state->mux};
+                    state->hook.reset();
+                }
+            }
+
+            m_inline_hooks.clear();
+        }
+
         for (auto& pair : m_plugins) {
             FreeLibrary(pair.second);
         }
 
-        m_inline_hooks.clear();
         m_plugins.clear();
     }
 
