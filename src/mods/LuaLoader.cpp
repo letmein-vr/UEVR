@@ -18,6 +18,18 @@
 
 #include <utility/Module.hpp>
 
+namespace {
+// Borderlands 4 only: hold the new state's ScriptContext lock while its scripts load (see reset_scripts).
+bool borderlands4_locks_lua_state_during_load() {
+    static const bool result = []() {
+        const auto exe_path = utility::get_module_pathw(utility::get_executable());
+        return exe_path && uevr::games::is_borderlands4_executable_path(*exe_path);
+    }();
+
+    return result;
+}
+}
+
 std::shared_ptr<LuaLoader>& LuaLoader::get() {
     static auto instance = std::make_shared<LuaLoader>();
     return instance;
@@ -279,6 +291,18 @@ void LuaLoader::reset_scripts() {
     spdlog::info("[LuaLoader] Destroyed all Lua states.");
 
     m_main_state = std::make_shared<ScriptState>(make_gc_data(), &g_plugin_initialize_param, true);
+
+    // Borderlands 4 (2026-11-07): run_script does not take the ScriptContext lock, but native callbacks on other
+    // threads (on_xinput_get_state on the XInput thread) take only that lock. A callback a half-loaded script had
+    // already registered (bl4_main.lua requires libs/input early) then ran Lua concurrently with the loading thread,
+    // corrupting the state (log: "Exception in on_xinput_get_state ... unknown error", then require('libs/ik') failing
+    // with the Lua file searcher missing). Holding the new context's lock until every script has run makes those
+    // callbacks wait. It is taken before any script runs, so no callback of this context can already hold it.
+    std::optional<std::unique_lock<std::recursive_mutex>> load_lock{};
+    if (borderlands4_locks_lua_state_during_load()) {
+        load_lock.emplace(m_main_state->context()->get_mutex());
+    }
+
     m_states.insert(m_states.begin(), m_main_state);
 
     for (auto& state : m_states) {
