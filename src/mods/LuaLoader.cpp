@@ -18,18 +18,6 @@
 
 #include <utility/Module.hpp>
 
-namespace {
-// Stalker 2 only: dispatch Lua events without holding LuaLoader's lock (see dispatch_event).
-bool stalker2_dispatches_lua_events_unlocked() {
-    static const bool result = []() {
-        const auto exe_path = utility::get_module_pathw(utility::get_executable());
-        return exe_path && uevr::games::is_stalker2_executable_path(*exe_path);
-    }();
-
-    return result;
-}
-}
-
 std::shared_ptr<LuaLoader>& LuaLoader::get() {
     static auto instance = std::make_shared<LuaLoader>();
     return instance;
@@ -367,31 +355,21 @@ void LuaLoader::add_additional_bindings(sol::state_view& lua) {
 }
 
 void LuaLoader::dispatch_event(std::string_view event_name, std::string_view event_data) {
-    if (stalker2_dispatches_lua_events_unlocked()) {
-        // Lock-order inversion (hard freeze, 2026-10-12): a plugin dispatching a Lua event from
-        // Present held m_access_mutex while waiting for the ScriptContext lock, while the game
-        // thread, running Lua under the ScriptContext lock, dispatched a custom event that a
-        // plugin turned back into a Lua event and waited for m_access_mutex. Hold only a
-        // reference to the state while dispatching; the ScriptContext lock is then the only
-        // lock taken here.
-        std::shared_ptr<ScriptState> state{};
-        {
-            std::scoped_lock _{m_access_mutex};
-            state = m_main_state;
-        }
-
-        if (state != nullptr) {
-            state->dispatch_event(event_name, event_data);
-        }
-
-        return;
+    // Lock-order inversion (hard freeze: Stalker 2 2026-10-12, Outer Worlds 2 2026-11-16): a plugin
+    // dispatching a Lua event from Present (CheekyFoveatedDLSS) held m_access_mutex while waiting for
+    // the ScriptContext lock, while the game thread, running Lua under the ScriptContext lock,
+    // dispatched a custom event that a plugin (uevr_utils.dll ExecuteFunction) turned back into a Lua
+    // event and waited for m_access_mutex. Hold only a reference to the state while dispatching; the
+    // ScriptContext lock is then the only lock taken here. Was Stalker 2 only; all games since
+    // 2026-11-16. A state can outlive a script reset by one in-flight dispatch (it is then destroyed
+    // on the dispatching thread).
+    std::shared_ptr<ScriptState> state{};
+    {
+        std::scoped_lock _{m_access_mutex};
+        state = m_main_state;
     }
 
-    std::scoped_lock _{m_access_mutex};
-
-    if (m_main_state == nullptr) {
-        return;
+    if (state != nullptr) {
+        state->dispatch_event(event_name, event_data);
     }
-
-    m_main_state->dispatch_event(event_name, event_data);
 }
