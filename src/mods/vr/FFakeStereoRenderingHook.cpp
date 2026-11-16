@@ -23857,6 +23857,23 @@ sdk::FSceneView* FFakeStereoRenderingHook::sceneview_constructor_impl(sdk::FScen
             validate_projection(values);
             hash_projection(values, sizeof(double) * 16);
         } else { native_projection_valid = false; }
+    } else if (is_ue5 && borderlands4_is_current_game()) {
+        // Borderlands 4 (UE5.5.4) extends FSceneViewProjectionData with Gearbox data at +0x130..+0x288
+        // (UESDK borderlands4_view_layout): ViewRect and ProjectionMatrix keep the stock +0x120 / +0xA0, but
+        // ConstrainedViewRect moves to +0x288. The stock struct read lands in Gearbox data, every eye pair failed
+        // "projection or view rectangle is invalid" and Native Fix never left the learning state.
+        constexpr uintptr_t bl4_projection_offset = 0xA0;
+        constexpr uintptr_t bl4_view_rect_offset = 0x120;
+        constexpr uintptr_t bl4_constrained_view_rect_offset = 0x288;
+        if (is_readable_process_range(reinterpret_cast<uintptr_t>(init_options), 0x300)) {
+            const auto* bytes = reinterpret_cast<const uint8_t*>(init_options);
+            std::memcpy(native_view_rect.bounds, bytes + bl4_view_rect_offset, sizeof(native_view_rect.bounds));
+            std::memcpy(native_constrained_view_rect.bounds, bytes + bl4_constrained_view_rect_offset,
+                sizeof(native_constrained_view_rect.bounds));
+            const auto* values = reinterpret_cast<const double*>(bytes + bl4_projection_offset);
+            validate_projection(values);
+            hash_projection(values, sizeof(double) * 16);
+        } else { native_projection_valid = false; }
     } else if (is_ue50_to_53) {
         std::memcpy(native_view_rect.bounds, init_options_ue50_to_53->view_rect, sizeof(native_view_rect.bounds));
         std::memcpy(native_constrained_view_rect.bounds, init_options_ue50_to_53->constrained_view_rect, sizeof(native_constrained_view_rect.bounds));
@@ -27997,7 +28014,11 @@ bool FFakeStereoRenderingHook::uses_native_last_pair_fallback() const {
 bool FFakeStereoRenderingHook::uses_frame_keyed_native_packets() const {
     // The key is only meaningful when VR::m_frame_count at Present comes from the RHI-ordered
     // command-list pose handoff; the Slate/direct fallbacks set it from the render thread.
-    return (stalker2_uses_validated_ue55_native_fix_capture_layout() || outerworlds2_uses_keyed_native_packets()) &&
+    // Borderlands 4 (UE5.5.4, DX12) shows the same delta 2/2 stale-packet refusals = right-eye black flicker under
+    // Native Fix; its log proves both prerequisites (frame count offset 0xac, command list hijacked).
+    const bool borderlands4_keyed = borderlands4_is_current_game() && g_framework != nullptr && g_framework->is_dx12();
+    return (stalker2_uses_validated_ue55_native_fix_capture_layout() || outerworlds2_uses_keyed_native_packets() ||
+            borderlands4_keyed) &&
         m_has_successful_command_list_hijack &&
         SceneViewExtensionAnalyzer::frame_count_offset != 0;
 }
