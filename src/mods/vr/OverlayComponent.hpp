@@ -7,6 +7,7 @@
 #include <chrono>
 
 #include "Mod.hpp"
+#include "Borderlands4ReticleLayer.hpp"
 
 #include "imgui.h"
 
@@ -61,6 +62,11 @@ public:
 
     float get_ui_invert_alpha() const {
         return std::clamp(m_ui_invert_alpha->value(), 0.0f, 1.0f);
+    }
+
+    // Borderlands 4 reticle layer state (see Borderlands4ReticleLayer.hpp); always inactive in other games
+    bl4_reticle::State get_bl4_reticle_state() const {
+        return m_bl4_reticle_state.snapshot();
     }
 
 private:
@@ -131,6 +137,9 @@ private:
     const ModToggle::Ptr m_framework_wrist_ui{ ModToggle::create("UI_Framework_WristUI", false) };
     const ModToggle::Ptr m_framework_mouse_emulation{ ModToggle::create("UI_Framework_MouseEmulation", true) };
 
+    // set by the BL4 profile Lua every tick; never saved (see Borderlands4ReticleLayer.hpp)
+    bl4_reticle::StateValue m_bl4_reticle_state{ "BL4_ReticleLayer" };
+
 public:
     OverlayComponent() 
         : m_openxr{this}
@@ -150,6 +159,11 @@ public:
             *m_framework_wrist_ui,
             *m_framework_mouse_emulation
         };
+
+        // only reachable through set_mod_value in Borderlands 4
+        if (bl4_reticle::is_current_game()) {
+            m_options.push_back(m_bl4_reticle_state);
+        }
     }
 
     // OpenXR
@@ -183,7 +197,11 @@ private:
         std::optional<std::reference_wrapper<XrCompositionLayerBaseHeader>> generate_daysgone_ahud_slate_layer();
         void reset_daysgone_ahud_pose();
         std::optional<std::reference_wrapper<XrCompositionLayerQuad>> generate_framework_ui_quad();
-        
+        // Borderlands 4 only: the cropped crosshair as a quad at the gun's aim point
+        std::optional<std::reference_wrapper<XrCompositionLayerQuad>> generate_bl4_reticle_quad(
+            const bl4_reticle::State& state,
+            const bl4_reticle::CropInfo& crop);
+
     private:
         XrCompositionLayerQuad m_slate_layer{};
         XrCompositionLayerQuad m_slate_layer_right{};
@@ -191,6 +209,7 @@ private:
         XrCompositionLayerCylinderKHR m_slate_layer_cylinder_right{};
         UILayerPoseBasis m_daysgone_ahud_pose_basis{};
         XrCompositionLayerQuad m_framework_ui_layer{};
+        XrCompositionLayerQuad m_bl4_reticle_layer{};
         OverlayComponent* m_parent{ nullptr };
         
         friend class OverlayComponent;

@@ -535,6 +535,7 @@ public:
         UI = EXTRA_START,
         UI_RIGHT, // For 2D view with stereoscopic
         FRAMEWORK_UI,
+        BL4_RETICLE, // Borderlands 4 only: crosshair cropped from UI (Borderlands4ReticleLayer.hpp)
 
         EXTRA_END,
 

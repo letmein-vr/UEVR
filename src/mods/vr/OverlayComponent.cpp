@@ -1251,4 +1251,89 @@ std::optional<std::reference_wrapper<XrCompositionLayerQuad>> OverlayComponent::
 
     return layer;
 }
+
+// Borderlands 4 reticle layer (see Borderlands4ReticleLayer.hpp). The aim ray is rebuilt every frame from the live
+// controller pose and the muzzle offset/direction Lua measured in the game's motion controller component frame, so
+// the reticle follows the gun without game-thread latency; only the hit distance comes from the game. The quad faces
+// the HMD and keeps the crosshair's angular size on the UI quad (times the Lua scale) at any distance.
+std::optional<std::reference_wrapper<XrCompositionLayerQuad>> OverlayComponent::OpenXR::generate_bl4_reticle_quad(
+    const bl4_reticle::State& state,
+    const bl4_reticle::CropInfo& crop)
+{
+    auto& vr = VR::get();
+
+    if (!state.active || !crop.valid || crop.width == 0 || crop.height == 0 || crop.ui_height == 0) {
+        return std::nullopt;
+    }
+
+    if (!vr->is_gui_enabled() || !vr->is_using_controllers()) {
+        return std::nullopt;
+    }
+
+    const auto swapchain_it = vr->m_openxr->swapchains.find((uint32_t)runtimes::OpenXR::SwapchainIndex::BL4_RETICLE);
+    if (swapchain_it == vr->m_openxr->swapchains.end()) {
+        return std::nullopt;
+    }
+
+    auto world_to_meters = vr->get_world_to_meters();
+    if (!(world_to_meters > 0.0f)) {
+        world_to_meters = 100.0f;
+    }
+
+    // UE (X forward, Y right, Z up) -> OpenXR (X right, Y up, -Z forward)
+    const auto ue_to_xr = [](const glm::vec3& v) { return glm::vec3{v.y, v.z, -v.x}; };
+
+    const auto controller_index = (uint32_t)vr->get_right_controller_index();
+    const auto use_grip = state.pose_type == 0;
+    const auto controller_pos = glm::vec3{vr->get_position(controller_index, use_grip)};
+    const auto controller_rot = glm::normalize(glm::quat{vr->get_rotation(controller_index, use_grip)});
+
+    const auto origin = controller_pos + controller_rot * (ue_to_xr(state.origin_ue) / world_to_meters);
+    const auto direction = glm::normalize(controller_rot * ue_to_xr(state.dir_ue));
+    const auto position = origin + direction * (state.distance_cm / world_to_meters);
+
+    const auto hmd_index = (uint32_t)vr->get_hmd_index();
+    const auto hmd_pos = glm::vec3{vr->get_position(hmd_index)};
+    const auto hmd_rot = glm::normalize(glm::quat{vr->get_rotation(hmd_index)});
+
+    const auto to_reticle = position - hmd_pos;
+    const auto view_distance = glm::length(to_reticle);
+    if (!std::isfinite(view_distance) || view_distance < 0.05f) {
+        return std::nullopt;
+    }
+
+    // quad +Z towards the viewer, +Y along the HMD's up (screen aligned like the UI)
+    const auto axis_z = -to_reticle / view_distance;
+    auto axis_x = glm::cross(hmd_rot * glm::vec3{0.0f, 1.0f, 0.0f}, axis_z);
+    if (glm::length(axis_x) < 1.0e-4f) {
+        axis_x = hmd_rot * glm::vec3{1.0f, 0.0f, 0.0f};
+    }
+    axis_x = glm::normalize(axis_x);
+    const auto axis_y = glm::cross(axis_z, axis_x);
+    const auto orientation = glm::normalize(glm::quat_cast(glm::mat3{axis_x, axis_y, axis_z}));
+
+    // the crop's angular height on the UI quad, kept at the reticle's distance
+    const auto slate_distance = std::max(m_parent->m_slate_distance->value(), 0.1f);
+    const auto angular_height = ((float)crop.height / (float)crop.ui_height) * m_parent->m_slate_size->value() / slate_distance;
+    const auto scale = std::clamp(state.scale, 0.05f, 20.0f);
+    const auto meters_h = view_distance * angular_height * scale;
+    const auto meters_w = meters_h * (float)crop.width / (float)crop.height;
+
+    auto& layer = this->m_bl4_reticle_layer;
+    layer = {};
+    layer.type = XR_TYPE_COMPOSITION_LAYER_QUAD;
+    layer.next = nullptr;
+    layer.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT; // same as the UI quad = same look
+    layer.space = vr->m_openxr->stage_space;
+    layer.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
+    layer.subImage.swapchain = swapchain_it->second.handle;
+    layer.subImage.imageRect.offset = {0, 0};
+    layer.subImage.imageRect.extent = {(int32_t)crop.width, (int32_t)crop.height};
+    layer.subImage.imageArrayIndex = 0;
+    layer.pose.orientation = runtimes::OpenXR::to_openxr(orientation);
+    layer.pose.position = runtimes::OpenXR::to_openxr(position);
+    layer.size = {meters_w, meters_h};
+
+    return layer;
+}
 }

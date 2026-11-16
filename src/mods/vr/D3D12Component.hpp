@@ -23,6 +23,7 @@
 #include "d3d12/CommandContext.hpp"
 #include "d3d12/TextureContext.hpp"
 #include "Stalker2NativeD3D12.hpp"
+#include "Borderlands4ReticleLayer.hpp"
 
 #include "PDAFWPlugin.h"
 
@@ -202,6 +203,16 @@ private:
     uint64_t m_stalker2_established_epoch{};
 
     d3d12::TextureContext m_game_ui_tex{};
+    // Borderlands 4 reticle layer: what the last UI copy cropped into the BL4_RETICLE swapchain
+    bl4_reticle::CropInfo m_bl4_reticle_crop{};
+    // colour-key passes (shaders/bl4_reticle_key.fx): src = a copy of the UI centre (sampled), out = the extracted,
+    // recoloured crosshair (copied to the BL4_RETICLE swapchain). Both SWAPCHAIN_SIZE square, in the UI's format.
+    d3d12::TextureContext m_bl4_reticle_src{};
+    d3d12::TextureContext m_bl4_reticle_out{};
+    DXGI_FORMAT m_bl4_reticle_tex_format{DXGI_FORMAT_UNKNOWN};
+    std::unique_ptr<DirectX::DX12::SpriteBatch> m_bl4_reticle_extract_batch{};
+    std::unique_ptr<DirectX::DX12::SpriteBatch> m_bl4_reticle_remove_batch{};
+    bool ensure_bl4_reticle_textures(ID3D12Device* device, const D3D12_RESOURCE_DESC& ui_desc);
     static constexpr uint32_t UE58_CONVERTED_UI_SLOT_COUNT = 3;
     // Slate can rotate native D3D12 resources between frames. Keep each source
     // SRV alive until the conversion command list that binds it has completed.

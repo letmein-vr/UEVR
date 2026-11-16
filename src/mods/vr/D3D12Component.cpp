@@ -27,6 +27,9 @@
 
 #include "shaders/Compiled/alpha_luminance_sprite_ps_SpritePixelShader.inc"
 #include "shaders/Compiled/alpha_luminance_sprite_ps_SpriteVertexShader.inc"
+#include "shaders/Compiled/bl4_reticle_key_SpriteVertexShader.inc"
+#include "shaders/Compiled/bl4_reticle_key_SpritePixelShaderExtract.inc"
+#include "shaders/Compiled/bl4_reticle_key_SpritePixelShaderRemove.inc"
 
 #include "d3d12/DirectXTK.hpp"
 
@@ -4096,12 +4099,103 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
                             1,
                             "[UE5.8][SlateUI] skipping OpenXR UI layer copy this frame because no converted UI texture is available");
                     } else {
-                        m_openxr.copy(
-                            (uint32_t)runtimes::OpenXR::SwapchainIndex::UI,
-                            ui_submit_texture,
-                            draw_2d_view,
-                            clear_rt,
-                            ENGINE_SRC_COLOR);
+                        // Borderlands 4 reticle layer (colour key, shaders/bl4_reticle_key.fx): the profile sets the
+                        // game's crosshair to key colours. The key-coloured pixels of the UI centre are recoloured
+                        // into their own swapchain, then erased from the UI (after the desktop mirror drew it) so the
+                        // crosshair is not shown twice. Nothing else in the UI is touched.
+                        std::optional<D3D12_BOX> bl4_reticle_box{};
+                        m_bl4_reticle_crop.valid = false;
+
+                        if (bl4_reticle::is_current_game() &&
+                            !ue58_ui_uses_shader_conversion &&
+                            m_game_ui_tex.texture.Get() == ui_submit_texture &&
+                            m_game_ui_tex.rtv_heap != nullptr &&
+                            m_game_ui_tex.srv_heap != nullptr)
+                        {
+                            const auto reticle = vr->get_overlay_component().get_bl4_reticle_state();
+                            const auto ui_desc = ui_submit_texture->GetDesc();
+                            const auto ui_w = (int32_t)ui_desc.Width;
+                            const auto ui_h = (int32_t)ui_desc.Height;
+                            const auto side = std::clamp<int32_t>((int32_t)reticle.crop_px, 8,
+                                std::min<int32_t>({(int32_t)bl4_reticle::SWAPCHAIN_SIZE, ui_w, ui_h}));
+
+                            if (reticle.active && side >= 8 && ensure_bl4_reticle_textures(device, ui_desc)) {
+                                const auto left = std::clamp<int32_t>(ui_w / 2 + (int32_t)reticle.crop_dx - side / 2, 0, ui_w - side);
+                                const auto top = std::clamp<int32_t>(ui_h / 2 + (int32_t)reticle.crop_dy - side / 2, 0, ui_h - side);
+
+                                D3D12_BOX crop_box{};
+                                crop_box.left = (UINT)left;
+                                crop_box.top = (UINT)top;
+                                crop_box.right = (UINT)(left + side);
+                                crop_box.bottom = (UINT)(top + side);
+                                crop_box.front = 0;
+                                crop_box.back = 1;
+
+                                D3D12_BOX out_box = crop_box;
+                                out_box.left = 0;
+                                out_box.top = 0;
+                                out_box.right = (UINT)side;
+                                out_box.bottom = (UINT)side;
+
+                                const auto extract = [this, ui_submit_texture, crop_box, side, reticle](d3d12::CommandContext& commands, ID3D12Resource*) {
+                                    auto box = crop_box;
+                                    commands.copy_region(ui_submit_texture, m_bl4_reticle_src.texture.Get(), &box, 0, 0, 0,
+                                        ENGINE_SRC_COLOR, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+
+                                    const float clear[4]{0.0f, 0.0f, 0.0f, 0.0f};
+                                    commands.clear_rtv(m_bl4_reticle_out, clear, D3D12_RESOURCE_STATE_RENDER_TARGET);
+
+                                    const RECT rect{0, 0, (LONG)side, (LONG)side};
+                                    for (int category = 0; category < 3; ++category) {
+                                        const auto& c = reticle.colors[category];
+                                        d3d12::render_srv_to_rtv(m_bl4_reticle_extract_batch.get(), commands.cmd_list.Get(),
+                                            m_bl4_reticle_src, m_bl4_reticle_out, rect, rect,
+                                            D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET,
+                                            std::nullopt, DirectX::XMFLOAT4{c.x, c.y, c.z, (float)(category + 1) * 0.25f});
+                                    }
+                                    commands.has_commands = true;
+                                };
+
+                                if (m_openxr.copy((uint32_t)runtimes::OpenXR::SwapchainIndex::BL4_RETICLE,
+                                        m_bl4_reticle_out.texture.Get(), extract, std::nullopt, D3D12_RESOURCE_STATE_RENDER_TARGET, &out_box))
+                                {
+                                    m_bl4_reticle_crop = {true, (uint32_t)side, (uint32_t)side, (uint32_t)ui_w, (uint32_t)ui_h};
+                                    bl4_reticle_box = crop_box;
+                                }
+                            }
+                        }
+
+                        if (bl4_reticle_box) {
+                            const auto crop_box = *bl4_reticle_box;
+                            m_openxr.copy(
+                                (uint32_t)runtimes::OpenXR::SwapchainIndex::UI,
+                                ui_submit_texture,
+                                [&, crop_box](d3d12::CommandContext& commands, ID3D12Resource* render_target) {
+                                    draw_2d_view(commands, render_target);
+
+                                    // erase the key-coloured pixels: copy the centre, draw it back through the remove shader
+                                    auto box = crop_box;
+                                    commands.copy_region(m_game_ui_tex.texture.Get(), m_bl4_reticle_src.texture.Get(), &box, 0, 0, 0,
+                                        ENGINE_SRC_COLOR, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+                                    const auto side = (LONG)(crop_box.right - crop_box.left);
+                                    const RECT src_rect{0, 0, side, side};
+                                    const RECT dst_rect{(LONG)crop_box.left, (LONG)crop_box.top, (LONG)crop_box.right, (LONG)crop_box.bottom};
+                                    d3d12::render_srv_to_rtv(m_bl4_reticle_remove_batch.get(), commands.cmd_list.Get(),
+                                        m_bl4_reticle_src, m_game_ui_tex, src_rect, dst_rect,
+                                        D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, ENGINE_SRC_COLOR,
+                                        std::nullopt, DirectX::XMFLOAT4{0.0f, 0.0f, 0.0f, ui_invert_alpha});
+                                    commands.has_commands = true;
+                                },
+                                clear_rt,
+                                ENGINE_SRC_COLOR);
+                        } else {
+                            m_openxr.copy(
+                                (uint32_t)runtimes::OpenXR::SwapchainIndex::UI,
+                                ui_submit_texture,
+                                draw_2d_view,
+                                clear_rt,
+                                ENGINE_SRC_COLOR);
+                        }
                         ue58_converted_ui_copied = ue58_ui_uses_shader_conversion;
                     }
 
@@ -4965,9 +5059,25 @@ vr::EVRCompositorError D3D12Component::on_frame(VR* vr) {
 
                 if (slate_layer) {
                     quad_layers.push_back(&slate_layer->get());
-                }   
+                }
             }
-            
+
+            // Borderlands 4 reticle layer, above the UI quad and below the UEVR menu
+            if (!suppress_ui_copy &&
+                !use_2d_screen &&
+                m_bl4_reticle_crop.valid &&
+                bl4_reticle::is_current_game() &&
+                m_openxr.ever_acquired((uint32_t)runtimes::OpenXR::SwapchainIndex::BL4_RETICLE))
+            {
+                const auto reticle = vr->get_overlay_component().get_bl4_reticle_state();
+
+                if (reticle.active) {
+                    if (const auto reticle_layer = openxr_overlay.generate_bl4_reticle_quad(reticle, m_bl4_reticle_crop)) {
+                        quad_layers.push_back((XrCompositionLayerBaseHeader*)&reticle_layer->get());
+                    }
+                }
+            }
+
             if (is_ue58_runtime_cached()) {
                 // Keep presenting the last released overlay image until the
                 // new GPU copy retires instead of serializing every frame.
@@ -5258,6 +5368,62 @@ void D3D12Component::log_openxr_swapchain_recreate(VR* vr, uint32_t reasons, uin
         m_last_afr_state,
         vr->is_using_afr(),
         swapchain_count);
+}
+
+// Borderlands 4 reticle colour key: the two SWAPCHAIN_SIZE textures, in the UI resource's format so region copies
+// from the UI and into the reticle swapchain stay valid. src rests in PIXEL_SHADER_RESOURCE, out in RENDER_TARGET.
+bool D3D12Component::ensure_bl4_reticle_textures(ID3D12Device* device, const D3D12_RESOURCE_DESC& ui_desc) {
+    if (m_bl4_reticle_extract_batch == nullptr || m_bl4_reticle_remove_batch == nullptr || device == nullptr) {
+        return false;
+    }
+
+    if (m_bl4_reticle_src.texture != nullptr && m_bl4_reticle_out.texture != nullptr &&
+        m_bl4_reticle_src.srv_heap != nullptr && m_bl4_reticle_out.rtv_heap != nullptr &&
+        m_bl4_reticle_tex_format == ui_desc.Format)
+    {
+        return true;
+    }
+
+    m_bl4_reticle_src.reset();
+    m_bl4_reticle_out.reset();
+    m_bl4_reticle_tex_format = DXGI_FORMAT_UNKNOWN;
+
+    D3D12_RESOURCE_DESC desc{};
+    desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    desc.Width = bl4_reticle::SWAPCHAIN_SIZE;
+    desc.Height = bl4_reticle::SWAPCHAIN_SIZE;
+    desc.DepthOrArraySize = 1;
+    desc.MipLevels = 1;
+    desc.Format = ui_desc.Format;
+    desc.SampleDesc.Count = 1;
+    desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+    desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+
+    D3D12_HEAP_PROPERTIES heap_props{};
+    heap_props.Type = D3D12_HEAP_TYPE_DEFAULT;
+
+    const auto create = [&](d3d12::TextureContext& ctx, D3D12_RESOURCE_STATES state, const wchar_t* name) {
+        ComPtr<ID3D12Resource> tex{};
+        if (FAILED(device->CreateCommittedResource(&heap_props, D3D12_HEAP_FLAG_NONE, &desc, state, nullptr, IID_PPV_ARGS(&tex)))) {
+            return false;
+        }
+        tex->SetName(name);
+        return ctx.setup(device, tex.Get(), DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_B8G8R8A8_UNORM, name);
+    };
+
+    if (!create(m_bl4_reticle_src, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, L"BL4 Reticle Source") ||
+        !create(m_bl4_reticle_out, D3D12_RESOURCE_STATE_RENDER_TARGET, L"BL4 Reticle Output"))
+    {
+        spdlog::error("[VR] Borderlands 4 reticle: failed to create the colour-key textures (format {})", (uint32_t)ui_desc.Format);
+        m_bl4_reticle_src.reset();
+        m_bl4_reticle_out.reset();
+        return false;
+    }
+
+    m_bl4_reticle_tex_format = ui_desc.Format;
+    spdlog::info("[VR] Borderlands 4 reticle: colour-key textures {}x{} format {}",
+        bl4_reticle::SWAPCHAIN_SIZE, bl4_reticle::SWAPCHAIN_SIZE, (uint32_t)ui_desc.Format);
+    return true;
 }
 
 std::unique_ptr<DirectX::DX12::SpriteBatch> D3D12Component::setup_sprite_batch_pso(
@@ -5833,6 +5999,11 @@ void D3D12Component::on_reset(VR* vr) {
     m_game_batch.reset();
     m_sw_zero_company_scene_conversion_batch.reset();
     m_ui_batch_alpha_invert.reset();
+    m_bl4_reticle_extract_batch.reset();
+    m_bl4_reticle_remove_batch.reset();
+    m_bl4_reticle_src.reset();
+    m_bl4_reticle_out.reset();
+    m_bl4_reticle_tex_format = DXGI_FORMAT_UNKNOWN;
     m_graphics_memory.reset();
 
     if (runtime->is_openxr() && runtime->loaded) {
@@ -6170,6 +6341,28 @@ bool D3D12Component::setup() {
         );
     }
 
+    // Borderlands 4 reticle colour key: extract = premultiplied-alpha blend into the cleared reticle texture (one draw
+    // per key category), remove = blending off, written straight back over the UI's centre.
+    if (bl4_reticle::is_current_game()) {
+        DirectX::SpriteBatchPipelineStateDescription extract_pd{DirectX::RenderTargetState{DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_UNKNOWN}};
+        m_bl4_reticle_extract_batch = setup_sprite_batch_pso(
+            DXGI_FORMAT_B8G8R8A8_UNORM,
+            bl4_reticle_key_SpritePixelShaderExtract,
+            bl4_reticle_key_SpriteVertexShader,
+            extract_pd);
+
+        DirectX::SpriteBatchPipelineStateDescription remove_pd{DirectX::RenderTargetState{DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_UNKNOWN}};
+        auto& remove_blend = remove_pd.blendDesc.RenderTarget[0];
+        remove_blend.BlendEnable = FALSE;
+        remove_blend.LogicOpEnable = FALSE;
+        remove_blend.RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+        m_bl4_reticle_remove_batch = setup_sprite_batch_pso(
+            DXGI_FORMAT_B8G8R8A8_UNORM,
+            bl4_reticle_key_SpritePixelShaderRemove,
+            bl4_reticle_key_SpriteVertexShader,
+            remove_pd);
+    }
+
     spdlog::info("[VR] d3d12 textures have been setup");
     m_force_reset = false;
 
@@ -6431,6 +6624,22 @@ std::optional<std::string> D3D12Component::OpenXR::create_swapchains() {
 
     if (auto err = create_swapchain((uint32_t)runtimes::OpenXR::SwapchainIndex::FRAMEWORK_UI, desktop_rt_swapchain_create_info, desktop_rt_desc)) {
         return err;
+    }
+
+    // Borderlands 4 reticle layer: the crosshair cropped from the UI (same format, so a region copy works)
+    if (bl4_reticle::is_current_game()) {
+        auto reticle_swapchain_create_info = desktop_rt_swapchain_create_info;
+        reticle_swapchain_create_info.width = bl4_reticle::SWAPCHAIN_SIZE;
+        reticle_swapchain_create_info.height = bl4_reticle::SWAPCHAIN_SIZE;
+
+        auto reticle_desc = desktop_rt_desc;
+        reticle_desc.Width = bl4_reticle::SWAPCHAIN_SIZE;
+        reticle_desc.Height = bl4_reticle::SWAPCHAIN_SIZE;
+
+        spdlog::info("[VR] Creating Borderlands 4 reticle swapchain {}x{}", bl4_reticle::SWAPCHAIN_SIZE, bl4_reticle::SWAPCHAIN_SIZE);
+        if (auto err = create_swapchain((uint32_t)runtimes::OpenXR::SwapchainIndex::BL4_RETICLE, reticle_swapchain_create_info, reticle_desc)) {
+            return err;
+        }
     }
 
     // Snapshot the mode once so a frontend/profile transition cannot enter the

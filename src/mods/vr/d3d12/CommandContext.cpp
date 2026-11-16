@@ -654,6 +654,43 @@ void CommandContext::clear_rtv(d3d12::TextureContext& tex, const float* color, D
     this->clear_rtv(tex.texture.Get(), tex.get_rtv(), color, dst_state);
 }
 
+void CommandContext::clear_rtv_rects(d3d12::TextureContext& tex, const float* color, const D3D12_RECT* rects, UINT num_rects,
+    D3D12_RESOURCE_STATES dst_state)
+{
+    if (tex.texture == nullptr || tex.rtv_heap == nullptr || rects == nullptr || num_rects == 0) {
+        return;
+    }
+
+    std::scoped_lock _{this->mtx};
+
+    auto* dst = tex.texture.Get();
+    D3D12_RESOURCE_BARRIER dst_barrier{};
+    dst_barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    dst_barrier.Flags = D3D12_RESOURCE_BARRIER_FLAG_NONE;
+    dst_barrier.Transition.pResource = dst;
+    dst_barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    dst_barrier.Transition.StateBefore = dst_state;
+    dst_barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
+
+    if (dst_state != D3D12_RESOURCE_STATE_RENDER_TARGET) {
+        D3D12_RESOURCE_BARRIER barriers[1]{dst_barrier};
+        record_barriers("VR::CommandContext::clear_rtv_rects/ToRT", 1, barriers);
+        this->cmd_list->ResourceBarrier(1, barriers);
+    }
+
+    this->cmd_list->ClearRenderTargetView(tex.get_rtv(), color, num_rects, rects);
+
+    if (dst_state != D3D12_RESOURCE_STATE_RENDER_TARGET) {
+        dst_barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+        dst_barrier.Transition.StateAfter = dst_state;
+        D3D12_RESOURCE_BARRIER barriers[1]{dst_barrier};
+        record_barriers("VR::CommandContext::clear_rtv_rects/Restore", 1, barriers);
+        this->cmd_list->ResourceBarrier(1, barriers);
+    }
+
+    this->has_commands = true;
+}
+
 bool CommandContext::references_retired() {
     std::scoped_lock _{this->mtx};
     return utility::gpu::references_retired(this->has_commands, this->waiting_for_fence,
