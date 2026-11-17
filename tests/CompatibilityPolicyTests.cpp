@@ -9,6 +9,7 @@
 #include <sdk/FSceneViewFamily.hpp>
 #include <sdk/FSceneViewLayoutPolicy.hpp>
 #include <sdk/MafiaDiscovery.hpp>
+#include "../dependencies/submodules/UESDK/tests/GloryFNameDiscoveryTests.hpp"
 
 #include "mods/GameSpecific.hpp"
 #include "utility/UObjectScanBudget.hpp"
@@ -26,6 +27,14 @@
 #include "mods/vr/KtjLHookContracts.hpp"
 #include "mods/vr/SWZeroCompanyBinary.hpp"
 #include "mods/vr/GearsEDayAllocation.hpp"
+#include "PhantomBladeZeroUITests.hpp"
+#include "Subnautica2BetaRenderTargetTests.hpp"
+#include "Subnautica2BetaSlateTests.hpp"
+#include "CVarExistingPriorityTests.hpp"
+#include "B1RendererTests.hpp"
+#include "StellarBladeSlateTests.hpp"
+#include "UE521ViewExtensionTests.hpp"
+#include "UE59RenderTests.hpp"
 
 namespace {
 
@@ -197,8 +206,10 @@ void test_scene_view_layouts() {
         "UE5.6 patch versions must select the UE5.6/5.7 layout");
     expect(classify_engine_version_string(L"5.8.2") == FSceneViewInitLayout::UE58,
         "UE5.8 patch versions must select the validated UE5.8 layout");
-    expect(classify_engine_version_string(L"5.9") == FSceneViewInitLayout::UnsupportedNewer,
-        "UE5.9 string detection must fail closed");
+    expect(classify_engine_version_string(L"5.8.4") == FSceneViewInitLayout::UE58,
+        "source-reviewed UE5.8.4 retains the UE5.8 view-init layout");
+    expect(classify_engine_version_string(L"5.9") == FSceneViewInitLayout::UE59,
+        "UE5.9 string detection selects its separate reviewed initializer prefix");
     expect(classify_engine_version_string(L"6.0") == FSceneViewInitLayout::UnsupportedNewer,
         "UE6 string detection must fail closed");
     expect(!classify_engine_version_string(L"5.5.4").has_value(),
@@ -230,7 +241,7 @@ void test_scene_view_layouts() {
         "UE5.7 must use the FSceneViewOwner layout");
     expect(classify_engine_version(5, 8) == FSceneViewInitLayout::UE58,
         "UE5.8 must use the skylight-scale layout");
-    expect(classify_engine_version(5, 9) == FSceneViewInitLayout::UnsupportedNewer,
+    expect(classify_engine_version(5, 10) == FSceneViewInitLayout::UnsupportedNewer,
         "unknown future UE5 layouts must fail closed");
     expect(classify_engine_version(6, 0) == FSceneViewInitLayout::UnsupportedNewer,
         "UE6 layouts must fail closed until validated");
@@ -1156,10 +1167,10 @@ void test_ue58_pooled_slate_fallback() {
         .pooled_wrapper_transactions = 1,
         .shared_strict_pooled_transactions = 1,
     };
-    for (uint32_t patch = 0; patch <= 4; ++patch) {
+    for (uint32_t patch = 0; patch <= 5; ++patch) {
         input.exact_ue58 = is_validated_ue58_slate_source_version(0x00050008, patch << 16);
-        expect(should_use_ue58_pooled_slate_fallback(input) == (patch <= 3),
-            "pooled fallback must be restricted to validated UE5.8.0-5.8.3 source versions");
+        expect(should_use_ue58_pooled_slate_fallback(input) == (patch <= 4),
+            "pooled fallback must be restricted to validated UE5.8.0-5.8.4 source versions");
     }
     input.exact_ue58 = false;
     expect(!should_use_ue58_pooled_slate_fallback(input),
@@ -1353,9 +1364,11 @@ void test_ue58_slate_ui_capability() {
         "UE5.8.2 must be eligible for validated Slate capability routing");
     expect(is_validated_ue58_slate_source_version(0x00050008, 0x00030000),
         "source-reviewed UE5.8.3 must be eligible for validated Slate capability routing");
+    expect(is_validated_ue58_slate_source_version(0x00050008, 0x00040000),
+        "source-reviewed UE5.8.4 must retain validated Slate capability routing");
     for (uint32_t revision : {0u, 1u, 0xffffu}) {
         for (uint32_t patch : {0u, 1u, 2u, 3u, 4u, 5u, 0xffffu}) {
-            expect(is_validated_ue58_slate_source_version(0x00050008, (patch << 16) | revision) == (patch <= 3),
+            expect(is_validated_ue58_slate_source_version(0x00050008, (patch << 16) | revision) == (patch <= 4),
                 "the build revision must not exclude reviewed patches or admit unreviewed UE5.8 patches");
         }
     }
@@ -1364,7 +1377,7 @@ void test_ue58_slate_ui_capability() {
     expect(!is_validated_ue58_slate_source_version(0x00050009, 0x00000000) &&
         !is_validated_ue58_slate_source_version(0x00040008, 0x00030000) &&
         !is_validated_ue58_slate_source_version(0x00060008, 0x00030000),
-        "different engine minors and majors must not inherit the reviewed UE5.8.3 contract");
+        "different engine minors and majors must not inherit the reviewed UE5.8.4 contract");
 
     UE58SlateCallABIObservation direct_call{
         .rcx_builder = true,
@@ -2556,9 +2569,51 @@ void test_ktjl_hook_contracts() {
 #include "GalacticRacerBinkTests.hpp"
 #include "GalacticRacerBinkSeekTests.hpp"
 #include "GearsEDayNativeFixTests.hpp"
+#include "FinalFantasyResonanceTests.hpp"
+#include "ShippingSceneViewTests.hpp"
 #include "FrameworkInitializationTests.hpp"
+#include "FinchNativeFixTests.hpp"
+#include "AbzuNativeFixTests.hpp"
+#include "FinchAimTests.hpp"
+#include "Pre57SlateDiscoveryTests.hpp"
+#include "Pre57UIResourceTests.hpp"
+#include "UE58NativeFixTests.hpp"
+#include "ParadoxDriveRHITests.hpp"
+#include "UE59BinaryTests.hpp"
+#include "UE59NativeFamilyTests.hpp"
 
 int main(int argc, char** argv) {
+    abzu_tests::run(expect);
+    if (argc == 3 && std::string_view{argv[1]} == "--abzu-image") { abzu_tests::shipping_image(argv[2],expect); }
+    ue59_render_tests::run(expect);
+    ue521_view_extension_tests::run(expect);
+    ue58_native_tests::run(expect);
+    paradoxdrive_rhi_tests::run(expect);
+    ue59_family_tests::run(expect);
+    if (argc == 4 && std::string_view{argv[1]} == "--ue59-image") { ue59_binary_tests::image(argv[2],argv[3],expect); }
+    if (argc == 3 && std::string_view{argv[1]} == "--ue58-native-image") { ue58_native_tests::shipping_image(argv[2], expect); }
+    glory_fname_tests::run(expect);
+    pbz_ui_tests::run(expect);
+    cvar_existing_priority_tests::run(expect);
+    b1_renderer_tests::run(expect);
+    if (argc == 3 && std::string_view{argv[1]} == "--glory-fname-image") { glory_fname_tests::shipping_image(argv[2], expect); }
+    test_pre57_ui_resources();
+    test_pre57_ui_safety();
+    if (argc == 3 && std::string_view{argv[1]} == "--pre57-ui-getter-fixture") { test_pre57_ui_getter_fixture(argv[2]); }
+    test_pre57_slate_discovery();
+    if (argc == 3 && std::string_view{argv[1]} == "--pre57-slate-fixture") { test_pre57_slate_fixture(argv[2]); }
+    test_finch_native_fix_contracts();
+    test_finch_aim_contracts();
+    test_finch_aim_pose();
+    if (argc == 3 && std::string_view{argv[1]} == "--finch-image") {
+        test_finch_native_fix_image(argv[2]);
+        test_finch_aim_image(argv[2]);
+    }
+    test_ffrs_texture_selection();
+    test_shipping_scene_view_layouts();
+    test_ffrs_engine_version();
+    if (argc == 3 && std::string_view{argv[1]} == "--ffrs-image") { test_ffrs_image(argv[2]); }
+    if (argc == 3 && std::string_view{argv[1]} == "--hotel188-image") { test_ffrs_image(argv[2], true); }
     test_framework_initialization();
     test_goweday_engine_allocation();
     test_goweday_native_family();
@@ -2606,10 +2661,13 @@ int main(int argc, char** argv) {
     test_mafia_discovery();
     test_family_snapshot_accessors();
     test_stellar_blade_callable_renderer_entry();
+    test_stellar_blade_slate_contract(expect);
     test_hifi_rush_callable_renderer_entry();
     test_sifu_callable_renderer_entry();
     test_sifu_native_mesh_commands();
     test_sw_zero_company_binary_revisions();
+    test_subnautica2_beta_render_target(expect);
+    test_subnautica2_beta_slate(expect);
 
     if (failures != 0) {
         std::cerr << failures << " compatibility policy test(s) failed\n";

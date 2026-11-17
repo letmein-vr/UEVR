@@ -202,8 +202,11 @@ private:
             const bl4_reticle::State& state,
             const bl4_reticle::CropInfo& crop);
 
+        std::optional<std::reference_wrapper<XrCompositionLayerQuad>> generate_dispatch_movie_layer();
+        
     private:
         XrCompositionLayerQuad m_slate_layer{};
+        XrCompositionLayerQuad m_dispatch_movie_layer{};
         XrCompositionLayerQuad m_slate_layer_right{};
         XrCompositionLayerCylinderKHR m_slate_layer_cylinder{};
         XrCompositionLayerCylinderKHR m_slate_layer_cylinder_right{};
